@@ -1,11 +1,10 @@
 """
-학습 콜백 클래스 (통계/저장/IO 개선판)
+학습 콜백 클래스
 """
 
-import csv
 import os
+import csv
 from collections import deque
-
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -14,7 +13,7 @@ class TrainingCallback(BaseCallback):
     """학습 진행 상황 추적 콜백"""
 
     def __init__(self, config, verbose=0):
-        super().__init__(verbose)
+        super(TrainingCallback, self).__init__(verbose)
         self.config = config
         self.episode_rewards = []
         self.episode_lengths = []
@@ -22,30 +21,31 @@ class TrainingCallback(BaseCallback):
         self.episode_count = 0
         self.csv_file = os.path.join(config.log_dir, "training_log.csv")
 
-        self.best_reward = float("-inf")
+        # 성능 추적
+        self.best_reward = float('-inf')
         self.recent_rewards = deque(maxlen=100)
         self.recent_successes = deque(maxlen=100)
         self.recent_success_rate = 0.0
 
+        # 단계 저장을 위한 변수
         self.saved_stages = set()
         self.stage_timesteps = config.get_stage_timesteps()
 
-        self.csv_buffer = []
-        self.csv_flush_every = max(1, int(getattr(config, "csv_flush_every", 100)))
-        self.print_every_episodes = max(1, int(getattr(config, "print_every_episodes", 20)))
-
-        with open(self.csv_file, "w", newline="") as f:
+        # CSV 파일 초기화
+        with open(self.csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "Timestep", "Episode", "Reward", "Length",
-                "Success", "Success_Rate", "Best_Reward", "Stage", "Env_Index"
+                'Timestep', 'Episode', 'Reward', 'Length',
+                'Success', 'Success_Rate', 'Best_Reward', 'Stage', 'Env_Index'
             ])
 
     def _on_step(self) -> bool:
+        # 단계별 모델 저장 체크
         self._check_stage_save()
 
-        dones = self.locals.get("dones", [])
-        infos = self.locals.get("infos", [])
+        # 병렬 환경의 모든 종료 에피소드 처리
+        dones = self.locals.get('dones', [])
+        infos = self.locals.get('infos', [])
         if len(dones) > 0:
             for env_idx, done in enumerate(dones):
                 if done:
@@ -54,13 +54,8 @@ class TrainingCallback(BaseCallback):
 
         return True
 
-    def _on_training_end(self) -> None:
-        self._flush_csv_buffer()
-
     def _check_stage_save(self):
-        if not getattr(self.config, "save_stage_models", True):
-            return
-
+        """단계별 모델/정규화 통계 저장"""
         current_timestep = self.num_timesteps
         vec_normalize_env = self.model.get_vec_normalize_env()
 
@@ -68,14 +63,15 @@ class TrainingCallback(BaseCallback):
             if stage_name in self.saved_stages or current_timestep < stage_timestep:
                 continue
 
-            if stage_name != "0_random":
+            # 0_random 은 실제 랜덤 정책이므로 모델은 저장하지 않음
+            if stage_name != '0_random':
                 model_path = os.path.join(self.config.model_dir, f"stage_{stage_name}.zip")
                 self.model.save(model_path)
 
             if vec_normalize_env is not None:
                 vecnorm_path = os.path.join(
                     self.config.model_dir,
-                    f"stage_{stage_name}_vecnormalize.pkl",
+                    f"stage_{stage_name}_vecnormalize.pkl"
                 )
                 vec_normalize_env.save(vecnorm_path)
 
@@ -94,12 +90,13 @@ class TrainingCallback(BaseCallback):
             print(f"💾 단계 저장: {stage_name} (Step {current_timestep})")
 
     def _handle_episode_end(self, info, env_idx: int):
-        if "episode" not in info:
+        """에피소드 종료 처리"""
+        if 'episode' not in info:
             return
 
-        episode_reward = info["episode"]["r"]
-        episode_length = info["episode"]["l"]
-        is_success = bool(info.get("is_success", False))
+        episode_reward = info['episode']['r']
+        episode_length = info['episode']['l']
+        is_success = bool(info.get('is_success', False))
 
         self.episode_rewards.append(episode_reward)
         self.episode_lengths.append(episode_length)
@@ -110,7 +107,11 @@ class TrainingCallback(BaseCallback):
         if is_success:
             self.success_count += 1
 
-        self.recent_success_rate = float(np.mean(self.recent_successes)) if self.recent_successes else 0.0
+        # 최근 100개 에피소드 기준 성공률 계산
+        if self.recent_successes:
+            self.recent_success_rate = float(np.mean(self.recent_successes))
+        else:
+            self.recent_success_rate = 0.0
 
         if episode_reward > self.best_reward:
             self.best_reward = episode_reward
@@ -120,22 +121,27 @@ class TrainingCallback(BaseCallback):
             )
 
         current_stage = self._get_current_stage()
-        if self.episode_count % self.print_every_episodes == 0:
+
+        if self.episode_count % 10 == 0:
             self._print_progress()
 
         self._save_to_csv(episode_reward, episode_length, is_success, current_stage, env_idx)
 
     def _get_current_stage(self) -> str:
+        """현재 학습 단계 반환"""
         current_timestep = self.num_timesteps
-        current_stage = "0_random"
+        current_stage = '0_random'
+
         for stage_name, stage_timestep in sorted(self.stage_timesteps.items(), key=lambda x: x[1]):
             if current_timestep >= stage_timestep:
                 current_stage = stage_name
             else:
                 break
+
         return current_stage
 
     def _print_progress(self):
+        """진행 상황 출력"""
         if not self.recent_rewards:
             return
 
@@ -147,33 +153,26 @@ class TrainingCallback(BaseCallback):
         )
 
         print(
-            f"📊 Episode {self.episode_count:5d} | "
-            f"Step {self.num_timesteps:9d} | "
-            f"Reward: {self.episode_rewards[-1]:8.2f} | "
-            f"Avg: {avg_reward:8.2f} | "
+            f"📊 Episode {self.episode_count:4d} | "
+            f"Step {self.num_timesteps:7d} | "
+            f"Reward: {self.episode_rewards[-1]:7.2f} | "
+            f"Avg: {avg_reward:7.2f} | "
             f"Len: {avg_length:6.1f} | "
             f"Success: {self.recent_success_rate:.3f}"
         )
 
     def _save_to_csv(self, episode_reward, episode_length, is_success, current_stage, env_idx):
-        self.csv_buffer.append([
-            self.num_timesteps,
-            self.episode_count,
-            episode_reward,
-            episode_length,
-            is_success,
-            self.recent_success_rate,
-            self.best_reward,
-            current_stage,
-            env_idx,
-        ])
-        if len(self.csv_buffer) >= self.csv_flush_every:
-            self._flush_csv_buffer()
-
-    def _flush_csv_buffer(self):
-        if not self.csv_buffer:
-            return
-        with open(self.csv_file, "a", newline="") as f:
+        """CSV 파일에 로그 저장"""
+        with open(self.csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerows(self.csv_buffer)
-        self.csv_buffer.clear()
+            writer.writerow([
+                self.num_timesteps,
+                self.episode_count,
+                episode_reward,
+                episode_length,
+                is_success,
+                self.recent_success_rate,
+                self.best_reward,
+                current_stage,
+                env_idx,
+            ])

@@ -1,34 +1,34 @@
-#학습 : train_sac.py
+#训练 : train_sac.py
 conda activate panda_rl
 cd ~/panda_mujoco_gym
 python train/train_sac.py
 -------------------------------------------------------------------------------------------
-#학습 중 tensorboard 확인
+#训练中查看 tensorboard
 conda activate panda_rl
 cd ~/panda_mujoco_gym
 tensorboard --logdir outputs/
 -------------------------------------------------------------------------------------------
-#gpu 로드량 확인
+#查看 GPU 负载
 watch -n 1 nvidia-smi
 -------------------------------------------------------------------------------------------
-#cpu 로드량 확인
+#查看 CPU 负载
 htop
 -------------------------------------------------------------------------------------------
-#가장 최근 모델 평가 및 비디오 생성
+#评估最新模型并生成视频
 conda activate panda_rl
 cd ~/panda_mujoco_gym
 python evaluate/evaluate_with_video.py --latest
 -------------------------------------------------------------------------------------------
-# 특정 outputs생성된 모델의 평가 및 비디오 생성
+#评估特定 outputs 生成的模型并生成视频
 conda activate panda_rl
 cd ~/panda_mujoco_gym
 export MUJOCO_GL=egl
 python evaluate/evaluate_with_video.py --exp-dir /home/dyros/panda_mujoco_gym/outputs/FrankaSlideDense-v0_SAC_20250720_235112
 
-# todo : sac, ppo, ddpg, td3등 on, off policy에 대해 학습을 진행하는 python file 만들고,
-이후 이에 맞는 환경 불러오도록 (ex. push, slide, pickandplace 코드 수정)
+# todo : 创建用于训练 sac、ppo、ddpg、td3 等 on-policy 和 off-policy 的 Python 文件，
+# 并修改相应代码以加载匹配的环境（例如：push、slide、pickandplace）。
 -------------------------------------------------------------------------------------------
-#panda_mujoco_gym의 디렉토리 구조
+#panda_mujoco_gym 的目录结构
 /home/dyros/panda_mujoco_gym/
 ├── train/
 │   ├── __init__.py
@@ -43,15 +43,15 @@ python evaluate/evaluate_with_video.py --exp-dir /home/dyros/panda_mujoco_gym/ou
 │
 ├── evaluate/             
 │   ├── __init__.py
-│   ├── evaluate_with_video.py    # 평가 + 비디오 통합 메인 스크립트
-│   ├── video_recorder.py         # 비디오 녹화 클래스들
-│   └── compare_models.py         # 모델 간 비교 (선택적)
+│   ├── evaluate_with_video.py    # 评估 + 视频整合主脚本
+│   ├── video_recorder.py         # 视频录制类
+│   └── compare_models.py         # 模型间比较（可选）
 │
 ├── outputs/
 │   └── {experiment_name}_{timestamp}/
 │       ├── models/
 │       ├── logs/
-│       ├── evaluation/           # 평가 결과 통합 폴더
+│       ├── evaluation/           # 评估结果整合文件夹
 │       │   ├── videos/
 │       │   │   ├── 0_random/
 │       │   │   ├── 1_20percent/
@@ -67,14 +67,14 @@ python evaluate/evaluate_with_video.py --exp-dir /home/dyros/panda_mujoco_gym/ou
     └── io_utils.py
     
 -------------------------------------------------------------------------------------------
-train_sac.py실행 후 outputs 폴더 구조
+train_sac.py执行后 outputs 文件夹结构
 outputs/
-└── FrankaSlideDense-v0_SAC_20241219_143022/  # 실험 폴더
+└── FrankaSlideDense-v0_SAC_20241219_143022/  # 实验文件夹
     ├── models/
-    │   ├── final_model.zip          # 최종 모델
-    │   ├── best_model.zip           # 최고 성능 모델  
-    │   ├── vec_normalize.pkl        # 정규화 통계
-    │   ├── stage_0_random.zip       # 각 단계별 모델
+    │   ├── final_model.zip          # 最终模型
+    │   ├── best_model.zip           # 最高性能模型  
+    │   ├── vec_normalize.pkl        # 正规化统计
+    │   ├── stage_0_random.zip       # 各阶段模型
     │   ├── stage_1_20percent.zip
     │   ├── stage_2_40percent.zip
     │   ├── stage_3_60percent.zip
@@ -82,21 +82,21 @@ outputs/
     │   └── stage_5_100percent.zip
     │
     ├── logs/
-    │   ├── training_log.csv         # 에피소드별 상세 로그
-    │   ├── training_summary.json    # 학습 전체 요약
-    │   └── tensorboard/             # TensorBoard 로그
+    │   ├── training_log.csv         # 每个回合的详细日志
+    │   ├── training_summary.json    # 学习整体摘要
+    │   └── tensorboard/             # TensorBoard 日志
     │       └── SAC_1/
     │
-    ├── checkpoints/                 # 정기 체크포인트
+    ├── checkpoints/                 # 定期检查点
     │   ├── sac_50000_steps.zip
     │   ├── sac_100000_steps.zip
     │   └── ...
     │
-    └── evaluation/                  # 평가 시 생성될 폴더 (train시엔 비어있음)
-        ├── videos/                  # evaluate_with_video.py 실행 시 생성
+    └── evaluation/                  # 评估时生成的文件夹（train时为空）
+        ├── videos/                  # evaluate_with_video.py 执行时生成
         │   ├── 0_random/
         │   ├── 1_20percent/
         │   └── ...
-        ├── performance_report.json  # 평가 후 생성
-        ├── evaluation_plots/        # 그래프들
-        └── comparison_results/      # 모델 비교 결과
+        ├── performance_report.json  # 评估后生成
+        ├── evaluation_plots/        # 图表
+        └── comparison_results/      # 模型比较结果
