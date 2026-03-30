@@ -125,25 +125,24 @@ class FrankaEnv(MujocoRobotEnv):
 
         action = np.clip(action, self.action_space.low, self.action_space.high)
         self._set_action(action)
-
         self._mujoco_step(action)
-
         self._step_callback()
 
         if self.render_mode == "human":
             self.render()
 
         obs = self._get_obs().copy()
+        ee_position = obs["observation"][:3]
+        achieved_goal = obs["achieved_goal"]
 
-        info = {"is_success": self._is_success(obs["achieved_goal"], self.goal)}
-
+        info = {
+            "is_success": self._is_success(achieved_goal, self.goal),
+            "ee_object_distance": float(np.linalg.norm(ee_position - achieved_goal)),
+            "object_height": float(achieved_goal[2] - self.initial_object_height),
+        }
         terminated = bool(info["is_success"])
-        truncated = bool(self.compute_truncated(obs["achieved_goal"], self.goal, info))
-
-
-        # terminated = info["is_success"]
-        # truncated = self.compute_truncated(obs["achieved_goal"], self.goal, info)
-        reward = self.compute_reward(obs["achieved_goal"], self.goal, info)
+        truncated = bool(self.compute_truncated(achieved_goal, self.goal, info))
+        reward = self.compute_reward(achieved_goal, self.goal, info)
 
         return obs, reward, terminated, truncated, info
 
@@ -151,8 +150,24 @@ class FrankaEnv(MujocoRobotEnv):
         d = self.goal_distance(achieved_goal, desired_goal)
         if self.reward_type == "sparse":
             return -(d > self.distance_threshold).astype(np.float32)
-        else:
-            return -d
+
+        reward = -d
+
+        # Pick-and-place 계열은 목표 거리만으로는 탐색이 매우 어려워서,
+        # 도달(reach)과 리프트(lift) 신호를 약하게 추가한다.
+        if not self.block_gripper:
+            ee_object_distance = float(info.get("ee_object_distance", 0.0))
+            object_height = max(float(info.get("object_height", 0.0)), 0.0)
+
+            reward -= 0.25 * ee_object_distance
+
+            if self.goal_z_range > 0.0:
+                lift_cap = max(self.goal_z_range, self.distance_threshold)
+                reward += 0.5 * min(object_height, lift_cap)
+                if object_height > self.distance_threshold:
+                    reward += 0.25
+
+        return reward
 
     def _set_action(self, action) -> None:
         action = action.copy()
@@ -259,8 +274,7 @@ class FrankaEnv(MujocoRobotEnv):
         return True
 
     def _mujoco_step(self, action: Optional[np.ndarray] = None) -> None:
-        for _ in range(10):
-            self._mujoco.mj_step(self.model, self.data, nstep=self.n_substeps)
+        self._mujoco.mj_step(self.model, self.data, nstep=self.n_substeps)
 
     # custom methods
     # -----------------------------
@@ -294,7 +308,9 @@ class FrankaEnv(MujocoRobotEnv):
         noise = self.np_random.uniform(self.goal_range_low, self.goal_range_high)
         # for the pick and place task
         if not self.block_gripper and self.goal_z_range > 0.0:
-            if self.np_random.random() < 0.3:
+            # 대부분은 탁자 위 목표를 유지하고, 일부만 공중 목표로 둔다.
+            # pick-and-place 초기 학습 난이도를 과도하게 높이지 않기 위함이다.
+            if self.np_random.random() < 0.7:
                 noise[2] = 0.0
         goal += noise
         return goal

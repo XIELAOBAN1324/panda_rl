@@ -32,44 +32,37 @@ def _predict_action(model, obs, env):
 
 
 def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
-    """모델 또는 랜덤 정책 성능 평가"""
+    """모델 또는 랜덤 정책 성능 평가.
+
+    evaluate_policy()는 성공률이나 개별 rollout 통계를 직접 제공하지 않으므로,
+    여기서는 모델/랜덤 정책 모두 동일한 수동 rollout 경로로 평가한다.
+    """
     policy_name = '랜덤 정책' if model is None else '모델'
-    print(f"\n📊 {policy_name} 성능 평가 중... ({num_episodes}개 에피소드)")
+    print(f"
+📊 {policy_name} 성능 평가 중... ({num_episodes}개 에피소드)")
 
-    if model is not None:
-        rewards, lengths = evaluate_policy(
-            model,
-            env,
-            n_eval_episodes=num_episodes,
-            deterministic=True,
-            return_episode_rewards=True,
-        )
-    else:
-        rewards = []
-        lengths = []
-
+    rewards = []
+    lengths = []
     success_count = 0
-    rollout_rewards = []
-    rollout_lengths = []
+
     for _ in range(num_episodes):
         obs = env.reset()
         done = False
         total_reward = 0.0
         length = 0
+
         while not done:
             action = _predict_action(model, obs, env)
             obs, reward, dones, infos = env.step(action)
             done = bool(dones[0])
             total_reward += float(reward[0])
             length += 1
+
             if done and infos[0].get('is_success', False):
                 success_count += 1
-        rollout_rewards.append(total_reward)
-        rollout_lengths.append(length)
 
-    if model is None:
-        rewards = rollout_rewards
-        lengths = rollout_lengths
+        rewards.append(total_reward)
+        lengths.append(length)
 
     results = {
         'mean_reward': float(np.mean(rewards)),
@@ -81,13 +74,14 @@ def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
         'num_episodes': num_episodes,
         'all_rewards': [float(r) for r in rewards],
         'all_lengths': [int(l) for l in lengths],
-        'rollout_mean_reward': float(np.mean(rollout_rewards)),
-        'rollout_mean_length': float(np.mean(rollout_lengths)),
+        'rollout_mean_reward': float(np.mean(rewards)),
+        'rollout_mean_length': float(np.mean(lengths)),
     }
 
     print(f"   평균 보상: {results['mean_reward']:.2f} ± {results['std_reward']:.2f}")
     print(f"   성공률: {results['success_rate']:.3f}")
     print(f"   평균 에피소드 길이: {results['mean_length']:.1f}")
+
     return results
 
 
@@ -104,19 +98,28 @@ def _get_vecnormalize_path(models_dir: str, model_name: str):
 def _build_stage_model_list(available_models: List[str], stages: List[str] = None) -> List[str]:
     if stages is None or 'all' in stages:
         selected = [m for m in available_models if m.startswith('stage_')]
+        if 'best_model' in available_models:
+            selected.append('best_model')
+        if 'final_model' in available_models:
+            selected.append('final_model')
     else:
         selected = []
         for stage in stages:
+            normalized_stage = stage.lower()
+            if normalized_stage == 'best' and 'best_model' in available_models:
+                selected.append('best_model')
+                continue
+            if normalized_stage == 'final' and 'final_model' in available_models:
+                selected.append('final_model')
+                continue
+
             model_name = stage if stage.startswith('stage_') else f'stage_{stage}'
             if model_name in available_models:
                 selected.append(model_name)
-        if 'final' in stages and 'final_model' in available_models:
-            selected.append('final_model')
-
-    if 'final_model' in available_models and (stages is None or 'all' in stages):
-        selected.append('final_model')
 
     def sort_key(name: str):
+        if name == 'best_model':
+            return (998, name)
         if name == 'final_model':
             return (999, name)
         if name.startswith('stage_'):
@@ -124,7 +127,7 @@ def _build_stage_model_list(available_models: List[str], stages: List[str] = Non
             try:
                 stage_num = int(stage_label.split('_', 1)[0])
             except ValueError:
-                stage_num = 998
+                stage_num = 997
             return (stage_num, name)
         return (997, name)
 

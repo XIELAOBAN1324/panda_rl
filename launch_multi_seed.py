@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
-"""Run multiple independent training jobs across multiple GPUs.
+"""
+Launch multiple panda_mujoco_gym training jobs across selected GPUs.
 
-This does not accelerate a *single* SB3 SAC learner, but it lets you use all GPUs
-for multi-seed or multi-environment sweeps.
+NOTE:
+When CUDA_VISIBLE_DEVICES is set to a single physical GPU, PyTorch sees that GPU
+as cuda:0 inside the child process. Passing cuda:{physical_id} at the same time
+causes device mismatches on GPU ids other than 0.
 """
 
 import argparse
@@ -28,32 +30,41 @@ def main():
 
     repo_root = Path(__file__).resolve().parent
     train_script = repo_root / "train" / "train_sac.py"
-    procs = []
 
+    procs = []
     for idx, seed in enumerate(args.seeds):
         gpu = gpu_ids[idx % len(gpu_ids)]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu
+
         cmd = [
             sys.executable,
             str(train_script),
-            "--env", args.env,
-            "--timesteps", str(args.timesteps),
-            "--n-envs", str(args.n_envs),
-            "--seed", str(seed),
-            "--device", f"cuda:{gpu}",
-            "--exp-name", f"{args.env}_seed{seed}_gpu{gpu}",
+            "--env",
+            args.env,
+            "--timesteps",
+            str(args.timesteps),
+            "--n-envs",
+            str(args.n_envs),
+            "--seed",
+            str(seed),
+            "--device",
+            "cuda:0",
+            "--exp-name",
+            f"{args.env}_seed{seed}_gpu{gpu}",
         ]
         if args.extra_args:
             cmd.extend(args.extra_args.split())
 
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
         log_path = repo_root / f"launch_seed{seed}_gpu{gpu}.log"
         with open(log_path, "w") as logf:
             proc = subprocess.Popen(cmd, cwd=repo_root, env=env, stdout=logf, stderr=subprocess.STDOUT)
-        procs.append((seed, gpu, proc.pid, str(log_path)))
-        print(f"Launched seed={seed} on gpu={gpu}, pid={proc.pid}, log={log_path}")
+            procs.append((seed, gpu, proc.pid, str(log_path)))
 
-    print("\nAll jobs launched.")
+        print(f"Launched seed={seed} on gpu={gpu}, pid={proc.pid}, device=cuda:0, log={log_path}")
+
+    print("
+All jobs launched.")
     for seed, gpu, pid, log_path in procs:
         print(f"  seed={seed} gpu={gpu} pid={pid} log={log_path}")
 

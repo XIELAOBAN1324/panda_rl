@@ -62,16 +62,21 @@ def configure_runtime(config: SACConfig) -> None:
 
 
 def create_env(env_name, render_mode=None, reward_scale=1.0, seed: Optional[int] = None):
-    raw = gym.make(env_name, render_mode=render_mode)
-    env = TimeLimit(raw, max_episode_steps=100)
-    env = Monitor(env)
+    env = gym.make(env_name, render_mode=render_mode)
+
+    # Reward scaling과 Monitor/episode 통계의 기준을 맞추기 위해
+    # 보상 스케일링을 먼저 적용한 뒤 Monitor를 감싼다.
     if reward_scale != 1.0:
         env = RewardScalingWrapper(env, scale=reward_scale)
+
+    env = Monitor(env)
     env = SuccessTrackingWrapper(env)
+
     if seed is not None:
         env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
+
     return env
 
 
@@ -96,7 +101,7 @@ def create_vec_env(
         vec_env = SubprocVecEnv(env_fns, start_method=start_method)
 
     if normalize:
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
 
     return vec_env
 
@@ -230,7 +235,7 @@ def train_sac(config: SACConfig):
     if config.enable_eval_callback and eval_env is not None and config.n_eval_episodes > 0:
         eval_callback = EvalCallback(
             eval_env,
-            best_model_save_path=os.path.join(config.model_dir, "best_model"),
+            best_model_save_path=config.model_dir,
             log_path=os.path.join(config.log_dir, "eval"),
             eval_freq=eval_freq,
             n_eval_episodes=config.n_eval_episodes,
