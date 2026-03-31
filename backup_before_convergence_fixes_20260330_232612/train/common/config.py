@@ -1,66 +1,82 @@
-"""학습 설정 클래스 (수렴 안정성 우선판)."""
+"""
+학습 설정 클래스 (속도/안정성 개선판)
+"""
 
 import os
 import random
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
 
 
 def _recommended_n_envs() -> int:
-    """MuJoCo + SB3 SAC 에서 과도한 병렬화로 인한 샘플 효율 저하를 피하기 위한 보수적 기본값."""
+    """보수적인 기본 병렬 환경 수.
+
+    MuJoCo 환경은 CPU 바운드이고, SB3 SAC 학습은 단일 learner 프로세스에서 진행된다.
+    너무 큰 n_envs 는 IPC/스케줄링 오버헤드를 늘릴 수 있으므로 기본값은 32로 제한한다.
+    """
     cpu_threads = os.cpu_count() or 8
-    return max(1, min(8, cpu_threads // 4))
+    return max(8, min(32, cpu_threads // 8 or 1))
 
 
 @dataclass
 class BaseConfig:
-    """기본 설정 클래스."""
+    """기본 설정 클래스"""
 
+    # 환경 설정
     env_name: str = "FrankaSlideDense-v0"
     algorithm: str = "SAC"
 
+    # 학습 설정
     total_timesteps: int = 1_000_000
     normalize_env: bool = True
-    reward_scale: float = 1.0
+    reward_scale: float = 0.1
 
+    # 평가/저장 설정: 원본보다 빈도를 크게 낮춰 학습 중 오버헤드를 줄임
     enable_eval_callback: bool = True
-    eval_freq: int = 50_000
-    n_eval_episodes: int = 3
+    eval_freq: int = 20_000
+    n_eval_episodes: int = 5
     eval_deterministic: bool = True
+
     enable_checkpoint_callback: bool = True
-    checkpoint_freq: int = 250_000
+    checkpoint_freq: int = 200_000
     save_replay_buffer_checkpoints: bool = False
     save_vecnormalize_checkpoints: bool = True
 
+    # 로그/진행 표시
     progress_bar: bool = False
     log_interval: int = 100
     print_every_episodes: int = 20
     csv_flush_every: int = 100
 
+    # 디렉토리 설정
     base_dir: str = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "outputs",
     )
     experiment_name: Optional[str] = None
 
+    # 시드
     seed: Optional[int] = None
 
+    # 런타임/하드웨어 설정
     device: str = "auto"
     torch_num_threads: int = 8
     torch_num_interop_threads: int = 2
     enable_tf32: bool = True
     vec_env_start_method: str = "forkserver"
 
+    # 단계별 저장
     save_stage_models: bool = True
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         if self.experiment_name is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.experiment_name = f"{self.env_name}_{self.algorithm}_{timestamp}"
+            self.experiment_name = (
+                f"{self.env_name}_{self.algorithm}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
 
         if self.seed is not None:
             random.seed(self.seed)
@@ -78,27 +94,31 @@ class BaseConfig:
         self.log_dir = os.path.join(self.exp_dir, "logs")
         self.checkpoint_dir = os.path.join(self.model_dir, "checkpoints")
 
-    def create_directories(self) -> None:
-        for dir_path in [self.exp_dir, self.model_dir, self.log_dir, self.checkpoint_dir]:
+    def create_directories(self):
+        dirs_to_create = [self.exp_dir, self.model_dir, self.log_dir, self.checkpoint_dir]
+        for dir_path in dirs_to_create:
             os.makedirs(dir_path, exist_ok=True)
             print(f"📁 디렉토리 생성: {dir_path}")
 
 
 @dataclass
 class SACConfig(BaseConfig):
-    """SAC 전용 설정 (샘플 효율/수렴 안정성 중심)."""
+    """SAC 전용 설정 (속도/처리량 중심)"""
 
+    # 벡터 환경 병렬 개수
     n_envs: int = field(default_factory=_recommended_n_envs)
 
-    learning_rate: float = 3e-4
+    # SAC 하이퍼파라미터
+    learning_rate: float = 1e-3
     buffer_size: int = 1_000_000
-    batch_size: int = 256
-    tau: float = 0.005
-    gamma: float = 0.98
-    learning_starts: int = 10_000
+    batch_size: int = 1024
+    tau: float = 0.05
+    gamma: float = 0.95
+    learning_starts: int = 5_000
     train_freq: int = 1
     gradient_steps: int = 1
 
+    # 네트워크 구조: 512x512x512 -> 256x256 으로 축소해 learner 처리량 개선
     policy_width: int = 256
     policy_depth: int = 2
     policy_kwargs: Dict[str, Any] = field(default_factory=lambda: {
@@ -107,10 +127,12 @@ class SACConfig(BaseConfig):
         "normalize_images": False,
     })
 
-    action_noise_std: float = 0.1
+    # 탐험
+    action_noise_std: float = 0.2
     use_sde: bool = True
     sde_sample_freq: int = 8
 
+    # 학습 단계 정의 (비디오 녹화용)
     stages: Dict[str, float] = field(default_factory=lambda: {
         "0_random": 0.0,
         "1_20percent": 0.2,
@@ -120,7 +142,8 @@ class SACConfig(BaseConfig):
         "5_100percent": 1.0,
     })
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
+        # policy_width/policy_depth 로부터 policy_kwargs 재구성
         self.policy_kwargs = {
             "net_arch": [self.policy_width] * self.policy_depth,
             "activation_fn": torch.nn.ReLU,
@@ -129,8 +152,4 @@ class SACConfig(BaseConfig):
         super().__post_init__()
 
     def get_stage_timesteps(self) -> Dict[str, int]:
-        return {
-            name: int(ratio * self.total_timesteps)
-            for name, ratio in self.stages.items()
-        }
-
+        return {name: int(ratio * self.total_timesteps) for name, ratio in self.stages.items()}
