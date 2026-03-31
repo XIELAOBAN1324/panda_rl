@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-SAC 训练脚本（加入 HER / sparse 任务更友好默认值 / dense checkpoint 初始化）
-"""
-
+"""SAC 학습 스크립트 (HER + aggressive pick-and-place curriculum 확장판)"""
 import argparse
 import json
 import os
@@ -13,40 +10,33 @@ from typing import Optional
 import gymnasium as gym
 import numpy as np
 import torch
-from stable_baselines3 import SAC
+from stable_baselines3 import SAC, HerReplayBuffer
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.noise import NormalActionNoise
-from stable_baselines3.common.vec_env import (
-    DummyVecEnv,
-    SubprocVecEnv,
-    VecNormalize,
-    sync_envs_normalization,
-)
-from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, sync_envs_normalization
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-import panda_mujoco_gym
+import panda_mujoco_gym  # noqa: F401
 from train.common.callbacks import TrainingCallback
 from train.common.config import SACConfig, _recommended_n_envs
+from train.common.curriculum import PickAndPlaceCurriculumWrapper
 from train.common.wrappers import RewardScalingWrapper, SuccessTrackingWrapper
 
 
 def configure_runtime(config: SACConfig) -> None:
-    """Torch/CUDA 运行时调优"""
+    """Torch/CUDA 런타임 튜닝"""
     if config.torch_num_threads is not None:
         torch.set_num_threads(int(config.torch_num_threads))
-
     if config.torch_num_interop_threads is not None:
         try:
             torch.set_num_interop_threads(int(config.torch_num_interop_threads))
         except RuntimeError:
-            # 已经设置过时忽略
             pass
 
     if config.enable_tf32 and torch.cuda.is_available():
@@ -57,7 +47,7 @@ def configure_runtime(config: SACConfig) -> None:
         except Exception:
             pass
 
-    print("⚙️ 运行时设置")
+    print("⚙️ 런타임 설정")
     print(f"  device: {config.device}")
     print(f"  torch_num_threads: {torch.get_num_threads()}")
     if torch.cuda.is_available():
@@ -67,13 +57,28 @@ def configure_runtime(config: SACConfig) -> None:
         print("  cuda available: False")
 
 
-def create_env(env_name, render_mode=None, reward_scale=1.0, seed: Optional[int] = None):
+def is_pick_and_place_sparse(env_name: str) -> bool:
+    return ("PickAndPlace" in env_name) and ("Sparse" in env_name)
+
+
+def create_env(
+    env_name,
+    render_mode=None,
+    reward_scale=1.0,
+    seed: Optional[int] = None,
+    curriculum: bool = False,
+    curriculum_total_env_steps: Optional[int] = None,
+):
     env = gym.make(env_name, render_mode=render_mode)
 
-    # 为了让 Monitor 记录到和真实训练一致的 reward，先做 reward scaling，再包 Monitor
+    if curriculum and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceCurriculumWrapper(
+            env,
+            total_env_steps_target=curriculum_total_env_steps or 1_000_000,
+        )
+
     if reward_scale != 1.0:
         env = RewardScalingWrapper(env, scale=reward_scale)
-
     env = Monitor(env)
     env = SuccessTrackingWrapper(env)
 
@@ -81,7 +86,6 @@ def create_env(env_name, render_mode=None, reward_scale=1.0, seed: Optional[int]
         env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
-
     return env
 
 
@@ -92,12 +96,19 @@ def create_vec_env(
     reward_scale=1.0,
     seed=None,
     start_method="forkserver",
+    curriculum: bool = False,
+    curriculum_total_env_steps: Optional[int] = None,
 ):
     def make_env(rank):
         def _init():
             env_seed = None if seed is None else seed + rank
-            return create_env(env_name, reward_scale=reward_scale, seed=env_seed)
-
+            return create_env(
+                env_name,
+                reward_scale=reward_scale,
+                seed=env_seed,
+                curriculum=curriculum,
+                curriculum_total_env_steps=curriculum_total_env_steps,
+            )
         return _init
 
     if n_envs == 1:
@@ -108,26 +119,12 @@ def create_vec_env(
 
     if normalize:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
-
     return vec_env
-
-
-def maybe_load_initial_weights(model: SAC, config: SACConfig) -> None:
-    if not config.init_model_path:
-        return
-
-    print(f"📥 从已有模型初始化权重: {config.init_model_path}")
-    source_model = SAC.load(config.init_model_path, device=config.device)
-    model.set_parameters(source_model.get_parameters(), exact_match=False)
-    del source_model
-    print("✅ 已将 actor/critic 权重拷贝到当前模型")
-
 
 
 def create_sac_model(env, config: SACConfig):
     n_actions = env.action_space.shape[-1]
     action_noise = None
-
     if not config.use_sde:
         action_noise = NormalActionNoise(
             mean=np.zeros(n_actions),
@@ -136,12 +133,13 @@ def create_sac_model(env, config: SACConfig):
 
     replay_buffer_class = None
     replay_buffer_kwargs = None
-    if config.use_her:
+    if config.her:
         replay_buffer_class = HerReplayBuffer
-        replay_buffer_kwargs = {
-            "n_sampled_goal": config.her_n_sampled_goal,
-            "goal_selection_strategy": config.her_goal_selection_strategy,
-        }
+        replay_buffer_kwargs = dict(
+            n_sampled_goal=config.n_sampled_goal,
+            goal_selection_strategy=config.goal_selection_strategy,
+            copy_info_dict=config.copy_info_dict,
+        )
 
     model = SAC(
         policy="MultiInputPolicy",
@@ -155,24 +153,22 @@ def create_sac_model(env, config: SACConfig):
         train_freq=config.train_freq,
         gradient_steps=config.gradient_steps,
         action_noise=action_noise,
-        replay_buffer_class=replay_buffer_class,
-        replay_buffer_kwargs=replay_buffer_kwargs,
         policy_kwargs=config.policy_kwargs,
         use_sde=config.use_sde,
         sde_sample_freq=config.sde_sample_freq,
+        ent_coef=config.ent_coef,
+        target_entropy=config.target_entropy,
+        replay_buffer_class=replay_buffer_class,
+        replay_buffer_kwargs=replay_buffer_kwargs,
         verbose=1,
         tensorboard_log=config.log_dir,
         device=config.device,
-        seed=config.seed,
     )
-
-    maybe_load_initial_weights(model, config)
     return model
 
 
 def _to_callback_frequency(target_steps: int, n_envs: int) -> int:
     return max(target_steps // max(n_envs, 1), 1)
-
 
 
 def _make_summary(config, training_time, mean_reward, std_reward, training_callback):
@@ -188,7 +184,6 @@ def _make_summary(config, training_time, mean_reward, std_reward, training_callb
         "experiment_name": config.experiment_name,
         "env_name": config.env_name,
         "algorithm": "SAC",
-        "her_enabled": bool(config.use_her),
         "total_timesteps": config.total_timesteps,
         "training_time_hours": training_time / 3600,
         "final_mean_reward": float(mean_reward),
@@ -200,37 +195,31 @@ def _make_summary(config, training_time, mean_reward, std_reward, training_callb
     }
 
 
-
 def _save_summary(summary, *paths):
     for summary_path in paths:
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=4)
-        print(f"📝 学习总结已保存: {summary_path}")
-
+        print(f"📄 학습 요약 저장: {summary_path}")
 
 
 def train_sac(config: SACConfig):
     configure_runtime(config)
-    print("🚀 SAC 训练开始!")
-    print(f"  环境: {config.env_name}")
-    print(f"  总步数: {config.total_timesteps:,}")
-    print(f"  n_envs: {config.n_envs}")
-    print(f"  start_method: {config.vec_env_start_method}")
-    print(f"  reward_scale: {config.reward_scale}")
-    print(f"  HER: {config.use_her}")
-    if config.use_her:
-        print(
-            f"  HER kwargs: n_sampled_goal={config.her_n_sampled_goal}, "
-            f"strategy={config.her_goal_selection_strategy}"
-        )
-    if config.init_model_path:
-        print(f"  init_model_path: {config.init_model_path}")
-    print(f"  输出目录: {config.exp_dir}")
+
+    print("🚀 SAC 학습 시작!")
+    print(f"🎯 환경: {config.env_name}")
+    print(f"📊 총 학습 스텝: {config.total_timesteps:,}")
+    print(f"⚙️ n_envs: {config.n_envs}")
+    print(f"⚙️ start_method: {config.vec_env_start_method}")
+    print(f"⚙️ HER: {config.her}")
+    print(f"⚙️ Curriculum: {config.curriculum}")
+    print(f"📁 결과 저장 위치: {config.exp_dir}")
     print("-" * 60)
 
     config.create_directories()
 
-    print("🧱 创建训练环境...")
+    per_env_total_steps = max(config.total_timesteps // max(config.n_envs, 1), 1)
+
+    print("🏗️ 환경 생성 중...")
     env = create_vec_env(
         config.env_name,
         n_envs=config.n_envs,
@@ -238,6 +227,8 @@ def train_sac(config: SACConfig):
         reward_scale=config.reward_scale,
         seed=config.seed,
         start_method=config.vec_env_start_method,
+        curriculum=config.curriculum,
+        curriculum_total_env_steps=config.curriculum_total_env_steps or per_env_total_steps,
     )
 
     eval_env = None
@@ -249,6 +240,8 @@ def train_sac(config: SACConfig):
             reward_scale=config.reward_scale,
             seed=config.seed,
             start_method=config.vec_env_start_method,
+            curriculum=False,  # 평가는 항상 full task 로 본다.
+            curriculum_total_env_steps=per_env_total_steps,
         )
         if isinstance(eval_env, VecNormalize):
             eval_env.training = False
@@ -257,7 +250,7 @@ def train_sac(config: SACConfig):
     logger_path = os.path.join(config.log_dir, "tensorboard")
     new_logger = configure(logger_path, ["stdout", "csv", "tensorboard"])
 
-    print("\n🧠 初始化 SAC 模型...")
+    print("\n🧠 SAC 모델 초기화...")
     model = create_sac_model(env, config)
     model.set_logger(new_logger)
 
@@ -265,11 +258,11 @@ def train_sac(config: SACConfig):
     checkpoint_freq = _to_callback_frequency(config.checkpoint_freq, config.n_envs)
 
     print(
-        f"  评估周期: {config.eval_freq} env-steps "
+        f"📈 평가 주기: {config.eval_freq} env-steps "
         f"(callback step {eval_freq}, n_envs={config.n_envs})"
     )
     print(
-        f"  checkpoint 周期: {config.checkpoint_freq} env-steps "
+        f"💾 체크포인트 주기: {config.checkpoint_freq} env-steps "
         f"(callback step {checkpoint_freq}, n_envs={config.n_envs})"
     )
 
@@ -299,10 +292,9 @@ def train_sac(config: SACConfig):
         )
         callbacks.append(checkpoint_callback)
 
-    print("\n🏃 开始训练!")
+    print("\n🎯 학습 시작!")
     print("=" * 60)
     start_time = time.time()
-
     try:
         model.learn(
             total_timesteps=config.total_timesteps,
@@ -311,19 +303,19 @@ def train_sac(config: SACConfig):
             progress_bar=config.progress_bar,
         )
     except KeyboardInterrupt:
-        print("\n⏸️ 训练已中断。")
+        print("\n⏸️ 학습이 중단되었습니다.")
 
     end_time = time.time()
     training_time = end_time - start_time
 
-    print("\n✅ 训练完成!")
-    print(f"⏱️ 总训练时间: {training_time / 3600:.2f} 小时")
+    print("\n✅ 학습 완료!")
+    print(f"⏱️ 총 학습 시간: {training_time / 3600:.2f}시간")
 
     final_model_path = os.path.join(config.model_dir, "final_model")
     model.save(final_model_path)
     if hasattr(env, "save"):
         env.save(os.path.join(config.model_dir, "vec_normalize.pkl"))
-    print(f"💾 最终模型已保存: {final_model_path}")
+    print(f"💾 최종 모델 저장: {final_model_path}")
 
     if eval_env is None:
         eval_env = create_vec_env(
@@ -333,6 +325,8 @@ def train_sac(config: SACConfig):
             reward_scale=config.reward_scale,
             seed=config.seed,
             start_method=config.vec_env_start_method,
+            curriculum=False,
+            curriculum_total_env_steps=per_env_total_steps,
         )
         if isinstance(eval_env, VecNormalize):
             eval_env.training = False
@@ -341,14 +335,14 @@ def train_sac(config: SACConfig):
     if isinstance(env, VecNormalize) and isinstance(eval_env, VecNormalize):
         sync_envs_normalization(env, eval_env)
 
-    print("\n📊 最终评估...")
+    print("\n📊 최종 평가...")
     mean_reward, std_reward = evaluate_policy(
         model,
         eval_env,
         n_eval_episodes=20,
         deterministic=True,
     )
-    print(f"  最终评估结果: {mean_reward:.2f} ± {std_reward:.2f}")
+    print(f"📈 최종 평가 결과: {mean_reward:.2f} ± {std_reward:.2f}")
 
     summary = _make_summary(config, training_time, mean_reward, std_reward, training_callback)
     _save_summary(
@@ -356,62 +350,79 @@ def train_sac(config: SACConfig):
         os.path.join(config.exp_dir, "training_summary.json"),
         os.path.join(config.log_dir, "training_summary.json"),
     )
-
     return model, env
 
 
+def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
+    if not is_pick_and_place_sparse(config.env_name):
+        return config
+
+    if args.reward_scale is None:
+        config.reward_scale = 1.0
+    if args.her is None:
+        config.her = True
+    if args.curriculum is None:
+        config.curriculum = True
+    if args.learning_rate is None:
+        config.learning_rate = 3e-4
+    if args.batch_size is None:
+        config.batch_size = 512
+    if args.learning_starts is None:
+        config.learning_starts = 10_000
+    if args.gradient_steps is None:
+        config.gradient_steps = 2
+    if args.gamma is None:
+        config.gamma = 0.98
+    if args.use_sde is None:
+        config.use_sde = False
+    if args.action_noise_std is None:
+        config.action_noise_std = 0.30
+    if args.ent_coef is None:
+        config.ent_coef = "auto_0.2"
+    return config
+
 
 def main():
-    parser = argparse.ArgumentParser(description="SAC 训练脚本（HER / sparse 友好版）")
-    parser.add_argument("--env", type=str, default="FrankaSlideDense-v0", help="环境名")
-    parser.add_argument("--timesteps", type=int, default=1_000_000, help="总训练步数")
-    parser.add_argument("--exp-name", type=str, default=None, help="实验名")
-    parser.add_argument(
-        "--reward-scale",
-        type=float,
-        default=None,
-        help="reward 缩放；默认 dense=0.1, sparse=1.0",
-    )
-    parser.add_argument("--n-envs", type=int, default=None, help="并行环境数")
-    parser.add_argument("--seed", type=int, default=None, help="随机种子")
-    parser.add_argument("--device", type=str, default="auto", help="训练设备 (auto/cpu/cuda/cuda:0)")
+    parser = argparse.ArgumentParser(description="SAC 학습 스크립트 (HER + aggressive curriculum 확장판)")
+    parser.add_argument("--env", type=str, default="FrankaSlideDense-v0", help="환경 이름")
+    parser.add_argument("--timesteps", type=int, default=1_000_000, help="총 학습 스텝")
+    parser.add_argument("--exp-name", type=str, default=None, help="실험 이름")
+    parser.add_argument("--reward-scale", type=float, default=None, help="보상 스케일 (미지정시 환경별 기본값)")
+    parser.add_argument("--n-envs", type=int, default=None, help="병렬 환경 개수")
+    parser.add_argument("--seed", type=int, default=None, help="난수 시드")
+    parser.add_argument("--device", type=str, default="auto", help="학습 디바이스 (auto/cpu/cuda/cuda:0)")
     parser.add_argument("--torch-threads", type=int, default=8, help="torch intra-op threads")
     parser.add_argument("--torch-interop-threads", type=int, default=2, help="torch inter-op threads")
-    parser.add_argument(
-        "--vec-start-method",
-        type=str,
-        default="forkserver",
-        choices=["fork", "forkserver", "spawn"],
-        help="SubprocVecEnv start method",
-    )
-    parser.add_argument("--eval-freq", type=int, default=20_000, help="训练中评估周期 (env-steps)")
-    parser.add_argument("--n-eval-episodes", type=int, default=5, help="训练中评估 episode 数")
-    parser.add_argument("--checkpoint-freq", type=int, default=200_000, help="checkpoint 保存周期 (env-steps)")
-    parser.add_argument("--save-replay-buffer", action="store_true", help="checkpoint 中保存 replay buffer")
-    parser.add_argument("--no-eval", action="store_true", help="关闭训练中评估")
-    parser.add_argument("--progress-bar", action="store_true", help="显示 progress bar")
-    parser.add_argument("--policy-width", type=int, default=256, help="policy/value hidden width")
-    parser.add_argument("--policy-depth", type=int, default=2, help="policy/value hidden depth")
-    parser.add_argument("--batch-size", type=int, default=1024, help="SAC batch size")
-    parser.add_argument("--no-tf32", action="store_true", help="关闭 Ampere+ GPU TF32")
+    parser.add_argument("--vec-start-method", type=str, default="forkserver", choices=["fork", "forkserver", "spawn"], help="SubprocVecEnv start method")
+    parser.add_argument("--eval-freq", type=int, default=20_000, help="학습 중 평가 주기 (env-steps)")
+    parser.add_argument("--n-eval-episodes", type=int, default=5, help="학습 중 평가 에피소드 수")
+    parser.add_argument("--checkpoint-freq", type=int, default=200_000, help="체크포인트 저장 주기 (env-steps)")
+    parser.add_argument("--save-replay-buffer", action="store_true", help="체크포인트에 replay buffer 저장")
+    parser.add_argument("--no-eval", action="store_true", help="학습 중 평가 비활성화")
+    parser.add_argument("--progress-bar", action="store_true", help="progress bar 표시")
+    parser.add_argument("--policy-width", type=int, default=256, help="정책/가치망 hidden width")
+    parser.add_argument("--policy-depth", type=int, default=2, help="정책/가치망 hidden depth")
+    parser.add_argument("--batch-size", type=int, default=None, help="SAC batch size")
+    parser.add_argument("--learning-rate", type=float, default=None, help="learning rate")
+    parser.add_argument("--learning-starts", type=int, default=None, help="random exploration steps before learning")
+    parser.add_argument("--gradient-steps", type=int, default=None, help="gradient steps per rollout step")
+    parser.add_argument("--gamma", type=float, default=None, help="discount factor")
+    parser.add_argument("--action-noise-std", type=float, default=None, help="normal action noise std when gSDE is disabled")
+    parser.add_argument("--ent-coef", type=str, default=None, help="entropy coefficient, e.g. auto or auto_0.2")
+    parser.add_argument("--no-tf32", action="store_true", help="Ampere 이상 GPU 의 TF32 비활성화")
 
-    parser.add_argument("--her", dest="use_her", action="store_true", help="启用 HER")
-    parser.add_argument("--no-her", dest="use_her", action="store_false", help="关闭 HER")
-    parser.set_defaults(use_her=None)
-    parser.add_argument("--her-goals", type=int, default=4, help="HER n_sampled_goal")
-    parser.add_argument(
-        "--goal-selection-strategy",
-        type=str,
-        default="future",
-        choices=["future", "final", "episode"],
-        help="HER goal_selection_strategy",
-    )
-    parser.add_argument(
-        "--init-model-path",
-        type=str,
-        default=None,
-        help="从已有 SAC checkpoint 初始化权重（适合 dense -> sparse）",
-    )
+    parser.set_defaults(her=None, curriculum=None, use_sde=None)
+    parser.add_argument("--her", dest="her", action="store_true", help="HER replay buffer 사용")
+    parser.add_argument("--no-her", dest="her", action="store_false", help="HER replay buffer 비활성화")
+    parser.add_argument("--n-sampled-goal", type=int, default=4, help="HER sampled goal 수")
+    parser.add_argument("--goal-selection-strategy", type=str, default="future", choices=["future", "final", "episode"], help="HER goal relabeling 전략")
+    parser.add_argument("--copy-info-dict", action="store_true", help="HER reward recompute 시 info dict 복사")
+
+    parser.add_argument("--curriculum", dest="curriculum", action="store_true", help="aggressive pick-and-place curriculum 사용")
+    parser.add_argument("--no-curriculum", dest="curriculum", action="store_false", help="curriculum 비활성화")
+
+    parser.add_argument("--use-sde", dest="use_sde", action="store_true", help="gSDE 사용")
+    parser.add_argument("--no-sde", dest="use_sde", action="store_false", help="gSDE 비활성화")
 
     args = parser.parse_args()
 
@@ -419,7 +430,7 @@ def main():
         env_name=args.env,
         total_timesteps=args.timesteps,
         experiment_name=args.exp_name,
-        reward_scale=args.reward_scale,
+        reward_scale=args.reward_scale if args.reward_scale is not None else 0.1,
         n_envs=args.n_envs if args.n_envs is not None else _recommended_n_envs(),
         seed=args.seed,
         device=args.device,
@@ -434,20 +445,29 @@ def main():
         progress_bar=args.progress_bar,
         policy_width=args.policy_width,
         policy_depth=args.policy_depth,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size if args.batch_size is not None else 1024,
+        learning_rate=args.learning_rate if args.learning_rate is not None else 1e-3,
+        learning_starts=args.learning_starts if args.learning_starts is not None else 5_000,
+        gradient_steps=args.gradient_steps if args.gradient_steps is not None else 1,
+        gamma=args.gamma if args.gamma is not None else 0.95,
+        action_noise_std=args.action_noise_std if args.action_noise_std is not None else 0.2,
+        ent_coef=args.ent_coef if args.ent_coef is not None else "auto",
+        use_sde=True if args.use_sde is None else args.use_sde,
+        her=False if args.her is None else args.her,
+        n_sampled_goal=args.n_sampled_goal,
+        goal_selection_strategy=args.goal_selection_strategy,
+        copy_info_dict=args.copy_info_dict,
+        curriculum=False if args.curriculum is None else args.curriculum,
         enable_tf32=not args.no_tf32,
-        use_her=args.use_her,
-        her_n_sampled_goal=args.her_goals,
-        her_goal_selection_strategy=args.goal_selection_strategy,
-        init_model_path=args.init_model_path,
     )
 
-    train_sac(config)
+    config = apply_pickplace_sparse_defaults(config, args)
 
+    train_sac(config)
     print("\n" + "=" * 60)
-    print("✅ 训练完成!")
-    print(f"📂 输出目录: {config.exp_dir}")
-    print("下一步:")
+    print("✅ 학습 완료!")
+    print(f"📁 결과 저장 위치: {config.exp_dir}")
+    print("다음 단계:")
     print(f"python evaluate/evaluate_with_video.py --exp-dir {config.exp_dir}")
     print("=" * 60)
 

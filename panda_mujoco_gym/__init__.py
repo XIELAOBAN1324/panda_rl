@@ -1,11 +1,9 @@
+#/home/dyros/panda_mujoco_gym/panda_mujoco_gym/__init__.py
 import os
 from gymnasium.envs.registration import register
 
 ENV_IDS = []
-
-# 对 PickAndPlace 给予更长的探索窗口。
-# Slide / Push 保持原先 100 步，避免影响原本已稳定收敛的任务。
-MAX_EPISODE_STEPS = {
+MAX_EPISODE_STEPS_BY_TASK = {
     "Slide": 100,
     "Push": 100,
     "PickAndPlace": 200,
@@ -19,6 +17,6 @@ for task in ["Slide", "Push", "PickAndPlace"]:
             id=env_id,
             entry_point=f"panda_mujoco_gym.envs:Franka{task}Env",
             kwargs={"reward_type": reward_type},
-            max_episode_steps=MAX_EPISODE_STEPS[task],
+            max_episode_steps=MAX_EPISODE_STEPS_BY_TASK[task],
         )
         ENV_IDS.append(env_id)
