@@ -1,20 +1,21 @@
+#/home/minjun/panda_mujoco_gym/test_env.py
+import sys
+import time
 import gymnasium as gym
 import panda_mujoco_gym
-import imageio
 
-env = gym.make("FrankaPickAndPlaceSparse-v0", render_mode="rgb_array")
-obs, info = env.reset()
+if __name__ == "__main__":
+    env = gym.make("FrankaPickAndPlaceSparse-v0", render_mode="human")
 
-frames = []
-for i in range(200):
-    action = env.action_space.sample()
-    obs, reward, terminated, truncated, info = env.step(action)
-    frame = env.render()
-    frames.append(frame)
+    observation, info = env.reset()
 
-    if terminated or truncated:
-        obs, info = env.reset()
+    for _ in range(1000):
+        action = env.action_space.sample()
+        observation, reward, terminated, truncated, info = env.step(action)
 
-env.close()
-imageio.mimsave("test_video.mp4", frames, fps=20)
-print("saved test_video.mp4")
+        if terminated or truncated:
+            observation, info = env.reset()
+
+        time.sleep(0.2)
+
+    env.close()
