@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SAC 학습 스크립트 (HER + aggressive pick-and-place curriculum 확장판)"""
+"""SAC 학습 스크립트 (HER 중심 pick-and-place sparse 기본값, curriculum 제거판)"""
 import argparse
 import json
 import os
@@ -25,8 +25,14 @@ if project_root not in sys.path:
 import panda_mujoco_gym  # noqa: F401
 from train.common.callbacks import TrainingCallback
 from train.common.config import SACConfig, _recommended_n_envs
-from train.common.curriculum import PickAndPlaceCurriculumWrapper
 from train.common.wrappers import RewardScalingWrapper, SuccessTrackingWrapper
+
+
+CURRICULUM_REMOVED_WARNING = (
+    "[WARN] Pick-and-place curriculum has been removed because it caused "
+    "reward/task mismatch on sparse training. The flag is ignored and full-task "
+    "training will be used."
+)
 
 
 def configure_runtime(config: SACConfig) -> None:
@@ -66,16 +72,8 @@ def create_env(
     render_mode=None,
     reward_scale=1.0,
     seed: Optional[int] = None,
-    curriculum: bool = False,
-    curriculum_total_env_steps: Optional[int] = None,
 ):
     env = gym.make(env_name, render_mode=render_mode)
-
-    if curriculum and is_pick_and_place_sparse(env_name):
-        env = PickAndPlaceCurriculumWrapper(
-            env,
-            total_env_steps_target=curriculum_total_env_steps or 1_000_000,
-        )
 
     if reward_scale != 1.0:
         env = RewardScalingWrapper(env, scale=reward_scale)
@@ -96,8 +94,6 @@ def create_vec_env(
     reward_scale=1.0,
     seed=None,
     start_method="forkserver",
-    curriculum: bool = False,
-    curriculum_total_env_steps: Optional[int] = None,
 ):
     def make_env(rank):
         def _init():
@@ -106,9 +102,8 @@ def create_vec_env(
                 env_name,
                 reward_scale=reward_scale,
                 seed=env_seed,
-                curriculum=curriculum,
-                curriculum_total_env_steps=curriculum_total_env_steps,
             )
+
         return _init
 
     if n_envs == 1:
@@ -211,13 +206,11 @@ def train_sac(config: SACConfig):
     print(f"⚙️ n_envs: {config.n_envs}")
     print(f"⚙️ start_method: {config.vec_env_start_method}")
     print(f"⚙️ HER: {config.her}")
-    print(f"⚙️ Curriculum: {config.curriculum}")
+    print("⚙️ Curriculum: removed (always full task)")
     print(f"📁 결과 저장 위치: {config.exp_dir}")
     print("-" * 60)
 
     config.create_directories()
-
-    per_env_total_steps = max(config.total_timesteps // max(config.n_envs, 1), 1)
 
     print("🏗️ 환경 생성 중...")
     env = create_vec_env(
@@ -227,8 +220,6 @@ def train_sac(config: SACConfig):
         reward_scale=config.reward_scale,
         seed=config.seed,
         start_method=config.vec_env_start_method,
-        curriculum=config.curriculum,
-        curriculum_total_env_steps=config.curriculum_total_env_steps or per_env_total_steps,
     )
 
     eval_env = None
@@ -240,8 +231,6 @@ def train_sac(config: SACConfig):
             reward_scale=config.reward_scale,
             seed=config.seed,
             start_method=config.vec_env_start_method,
-            curriculum=False,  # 평가는 항상 full task 로 본다.
-            curriculum_total_env_steps=per_env_total_steps,
         )
         if isinstance(eval_env, VecNormalize):
             eval_env.training = False
@@ -325,8 +314,6 @@ def train_sac(config: SACConfig):
             reward_scale=config.reward_scale,
             seed=config.seed,
             start_method=config.vec_env_start_method,
-            curriculum=False,
-            curriculum_total_env_steps=per_env_total_steps,
         )
         if isinstance(eval_env, VecNormalize):
             eval_env.training = False
@@ -361,8 +348,9 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
         config.reward_scale = 1.0
     if args.her is None:
         config.her = True
-    if args.curriculum is None:
-        config.curriculum = True
+    config.curriculum = False
+    if args.n_envs is None:
+        config.n_envs = 1
     if args.learning_rate is None:
         config.learning_rate = 3e-4
     if args.batch_size is None:
@@ -383,7 +371,7 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SAC 학습 스크립트 (HER + aggressive curriculum 확장판)")
+    parser = argparse.ArgumentParser(description="SAC 학습 스크립트 (HER 중심 pick-and-place sparse 기본값, curriculum 제거판)")
     parser.add_argument("--env", type=str, default="FrankaSlideDense-v0", help="환경 이름")
     parser.add_argument("--timesteps", type=int, default=1_000_000, help="총 학습 스텝")
     parser.add_argument("--exp-name", type=str, default=None, help="실험 이름")
@@ -418,13 +406,16 @@ def main():
     parser.add_argument("--goal-selection-strategy", type=str, default="future", choices=["future", "final", "episode"], help="HER goal relabeling 전략")
     parser.add_argument("--copy-info-dict", action="store_true", help="HER reward recompute 시 info dict 복사")
 
-    parser.add_argument("--curriculum", dest="curriculum", action="store_true", help="aggressive pick-and-place curriculum 사용")
-    parser.add_argument("--no-curriculum", dest="curriculum", action="store_false", help="curriculum 비활성화")
+    parser.add_argument("--curriculum", dest="curriculum", action="store_true", help="deprecated: ignored, curriculum has been removed")
+    parser.add_argument("--no-curriculum", dest="curriculum", action="store_false", help="deprecated: ignored, curriculum has been removed")
 
     parser.add_argument("--use-sde", dest="use_sde", action="store_true", help="gSDE 사용")
     parser.add_argument("--no-sde", dest="use_sde", action="store_false", help="gSDE 비활성화")
 
     args = parser.parse_args()
+
+    if args.curriculum:
+        print(CURRICULUM_REMOVED_WARNING)
 
     config = SACConfig(
         env_name=args.env,
@@ -457,7 +448,7 @@ def main():
         n_sampled_goal=args.n_sampled_goal,
         goal_selection_strategy=args.goal_selection_strategy,
         copy_info_dict=args.copy_info_dict,
-        curriculum=False if args.curriculum is None else args.curriculum,
+        curriculum=False,
         enable_tf32=not args.no_tf32,
     )
 

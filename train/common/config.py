@@ -1,4 +1,4 @@
-"""학습 설정 클래스 (pick-and-place sparse + HER + curriculum 확장판)"""
+"""학습 설정 클래스 (pick-and-place sparse + HER 기본값, curriculum 제거판)"""
 import os
 import random
 from datetime import datetime
@@ -95,7 +95,7 @@ class BaseConfig:
 
 @dataclass
 class SACConfig(BaseConfig):
-    """SAC 전용 설정 (HER / curriculum 확장)"""
+    """SAC 전용 설정 (HER 지원, curriculum 비활성화)"""
 
     # 벡터 환경 병렬 개수
     n_envs: int = field(default_factory=_recommended_n_envs)
@@ -132,7 +132,7 @@ class SACConfig(BaseConfig):
     goal_selection_strategy: str = "future"
     copy_info_dict: bool = False
 
-    # Curriculum
+    # Curriculum (하위 호환용 no-op)
     curriculum: bool = False
     curriculum_total_env_steps: Optional[int] = None
 
@@ -155,6 +155,8 @@ class SACConfig(BaseConfig):
             "activation_fn": torch.nn.ReLU,
             "normalize_images": False,
         }
+        self.curriculum = False
+        self.curriculum_total_env_steps = None
         super().__post_init__()
 
     def get_stage_timesteps(self) -> Dict[str, int]:
