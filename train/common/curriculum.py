@@ -1,4 +1,4 @@
-"""Pick-and-place sparse 학습용 aggressive curriculum wrapper."""
+"""Pick-and-place sparse 학습용 curriculum wrappers."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -262,4 +262,229 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
             reward += 1.0
 
         info["curriculum_shaping_bonus"] = shaping_bonus
+        return obs, reward, terminated, truncated, info
+
+
+@dataclass(frozen=True)
+class SafeCurriculumStage:
+    name: str
+    progress_upper: float
+    object_xy_range: float
+    goal_radius_min: float
+    goal_radius_max: float
+    goal_min_z: float
+    goal_max_z: float
+    air_goal_prob: float
+    spawn_ee_above_object: bool = False
+    ee_hover_height: float = 0.0
+    settle_steps: int = 0
+    use_env_default_goal: bool = False
+
+
+class SafePickAndPlaceCurriculumWrapper(gym.Wrapper):
+    """Reward/termination semantics를 바꾸지 않는 안전한 curriculum.
+
+    원칙
+    - reward 를 절대 수정하지 않는다.
+    - success 조건/termination 조건을 수정하지 않는다.
+    - reset 시점의 object/goal 분포만 단계적으로 넓힌다.
+    """
+
+    def __init__(self, env: gym.Env, total_env_steps_target: int = 1_000_000):
+        super().__init__(env)
+        self.total_env_steps_target = max(int(total_env_steps_target), 1)
+        self.local_env_steps = 0
+        self.current_stage: SafeCurriculumStage | None = None
+
+        base = self.unwrapped
+        self.base_obj_xy_range = float(getattr(base, "obj_xy_range", 0.3))
+        self.base_goal_xy_range = float(getattr(base, "goal_xy_range", 0.3))
+        self.base_goal_z_range = float(getattr(base, "goal_z_range", 0.2))
+        self.base_obj_range_low = np.array(getattr(base, "obj_range_low"), dtype=np.float64).copy()
+        self.base_obj_range_high = np.array(getattr(base, "obj_range_high"), dtype=np.float64).copy()
+        self.base_goal_range_low = np.array(getattr(base, "goal_range_low"), dtype=np.float64).copy()
+        self.base_goal_range_high = np.array(getattr(base, "goal_range_high"), dtype=np.float64).copy()
+        self.base_obj_center = (self.base_obj_range_low + self.base_obj_range_high) / 2.0
+        self.base_goal_center = (self.base_goal_range_low + self.base_goal_range_high) / 2.0
+
+        self.stages: List[SafeCurriculumStage] = [
+            SafeCurriculumStage(
+                name="lift-near-goal",
+                progress_upper=0.30,
+                object_xy_range=0.08,
+                goal_radius_min=0.07,
+                goal_radius_max=0.11,
+                goal_min_z=0.05,
+                goal_max_z=0.09,
+                air_goal_prob=1.00,
+                spawn_ee_above_object=True,
+                ee_hover_height=0.10,
+                settle_steps=2,
+            ),
+            SafeCurriculumStage(
+                name="short-air-carry",
+                progress_upper=0.60,
+                object_xy_range=0.14,
+                goal_radius_min=0.08,
+                goal_radius_max=0.14,
+                goal_min_z=0.04,
+                goal_max_z=0.10,
+                air_goal_prob=0.85,
+                spawn_ee_above_object=True,
+                ee_hover_height=0.09,
+                settle_steps=1,
+            ),
+            SafeCurriculumStage(
+                name="mixed-carry",
+                progress_upper=0.85,
+                object_xy_range=0.22,
+                goal_radius_min=0.08,
+                goal_radius_max=0.22,
+                goal_min_z=0.00,
+                goal_max_z=0.16,
+                air_goal_prob=0.65,
+                spawn_ee_above_object=True,
+                ee_hover_height=0.08,
+                settle_steps=1,
+            ),
+            SafeCurriculumStage(
+                name="full-task",
+                progress_upper=1.01,
+                object_xy_range=self.base_obj_xy_range,
+                goal_radius_min=0.00,
+                goal_radius_max=self.base_goal_xy_range,
+                goal_min_z=0.00,
+                goal_max_z=self.base_goal_z_range,
+                air_goal_prob=0.70,
+                use_env_default_goal=True,
+            ),
+        ]
+
+    @property
+    def np_random(self):
+        return self.unwrapped.np_random
+
+    def _progress(self) -> float:
+        return min(self.local_env_steps / float(self.total_env_steps_target), 1.0)
+
+    def _pick_stage(self) -> SafeCurriculumStage:
+        p = self._progress()
+        for stage in self.stages:
+            if p <= stage.progress_upper:
+                return stage
+        return self.stages[-1]
+
+    def _set_square_range(self, center: np.ndarray, xy_range: float, z_low: float, z_high: float):
+        low = np.array(center, dtype=np.float64).copy()
+        high = np.array(center, dtype=np.float64).copy()
+        low[:2] += np.array([-xy_range / 2.0, -xy_range / 2.0])
+        high[:2] += np.array([xy_range / 2.0, xy_range / 2.0])
+        low[2] = z_low
+        high[2] = z_high
+        return low, high
+
+    def _apply_stage_pre_reset(self, stage: SafeCurriculumStage) -> None:
+        base = self.unwrapped
+        base.obj_xy_range = stage.object_xy_range
+        base.obj_range_low, base.obj_range_high = self._set_square_range(
+            self.base_obj_center, stage.object_xy_range, self.base_obj_center[2], self.base_obj_center[2]
+        )
+        # Keep goal range aligned with stage for env default sampling path.
+        goal_xy = max(stage.goal_radius_max * 2.0, 1e-3)
+        base.goal_range_low, base.goal_range_high = self._set_square_range(
+            self.base_goal_center,
+            goal_xy,
+            self.base_goal_center[2],
+            self.base_goal_center[2] + stage.goal_max_z,
+        )
+
+    def _sample_goal_near_object(self, object_pos: np.ndarray, stage: SafeCurriculumStage) -> np.ndarray:
+        base = self.unwrapped
+        goal_dtype = np.asarray(base.goal).dtype if hasattr(base, "goal") else np.float64
+        min_distance = (
+            float(base.minimum_goal_object_distance())
+            if hasattr(base, "minimum_goal_object_distance")
+            else float(getattr(base, "distance_threshold", 0.05) + 0.02)
+        )
+
+        best_goal = None
+        best_distance = float("-inf")
+
+        for _ in range(64):
+            goal = np.array(object_pos, dtype=np.float64).copy()
+
+            radius = float(self.np_random.uniform(stage.goal_radius_min, stage.goal_radius_max))
+            theta = float(self.np_random.uniform(-np.pi, np.pi))
+            goal[:2] += radius * np.array([np.cos(theta), np.sin(theta)])
+
+            if self.np_random.random() < stage.air_goal_prob:
+                goal[2] = float(
+                    base.initial_object_height
+                    + self.np_random.uniform(stage.goal_min_z, stage.goal_max_z)
+                )
+            else:
+                goal[2] = float(base.initial_object_height)
+
+            goal = np.clip(goal, self.base_goal_range_low, self.base_goal_range_high)
+            distance = float(np.linalg.norm(goal - object_pos))
+            if distance > best_distance:
+                best_goal = goal.copy()
+                best_distance = distance
+
+            if distance >= min_distance:
+                return goal.astype(goal_dtype)
+
+        return np.asarray(best_goal, dtype=goal_dtype)
+
+    def _move_ee_above_object(self, object_pos: np.ndarray, stage: SafeCurriculumStage) -> None:
+        base = self.unwrapped
+        if not hasattr(base, "set_mocap_pose"):
+            return
+
+        hover = np.array(object_pos, dtype=np.float64).copy()
+        hover[2] = max(
+            float(object_pos[2] + stage.ee_hover_height),
+            float(base.initial_object_height + 0.08),
+        )
+        base.set_mocap_pose(hover, base.grasp_site_pose)
+
+        if hasattr(base, "ctrl_range") and getattr(base, "block_gripper", True) is False:
+            open_half_width = float(np.clip(0.04, base.ctrl_range[-1, 0], base.ctrl_range[-1, 1]))
+            base.data.ctrl[-2:] = open_half_width
+
+        for _ in range(max(stage.settle_steps, 0)):
+            base._mujoco_step()
+        base._mujoco.mj_forward(base.model, base.data)
+
+    def reset(self, **kwargs):
+        self.current_stage = self._pick_stage()
+        self._apply_stage_pre_reset(self.current_stage)
+
+        obs, info = self.env.reset(**kwargs)
+        info = dict(info)
+        object_pos = np.array(obs["achieved_goal"], dtype=np.float64).copy()
+
+        if self.current_stage.spawn_ee_above_object:
+            self._move_ee_above_object(object_pos, self.current_stage)
+            obs = self.unwrapped._get_obs().copy()
+            object_pos = np.array(obs["achieved_goal"], dtype=np.float64).copy()
+
+        if not self.current_stage.use_env_default_goal:
+            new_goal = self._sample_goal_near_object(object_pos, self.current_stage)
+            self.unwrapped.goal = new_goal.copy()
+            if hasattr(self.unwrapped, "_render_callback"):
+                self.unwrapped._render_callback()
+            obs = self.unwrapped._get_obs().copy()
+
+        info["curriculum_stage"] = self.current_stage.name
+        info["curriculum_progress"] = self._progress()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.local_env_steps += 1
+        info = dict(info)
+        if self.current_stage is not None:
+            info["curriculum_stage"] = self.current_stage.name
+            info["curriculum_progress"] = self._progress()
         return obs, reward, terminated, truncated, info

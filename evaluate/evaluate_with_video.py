@@ -46,12 +46,14 @@ def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
     rewards = []
     lengths = []
     success_count = 0
+    terminal_success_count = 0
 
     for _ in range(num_episodes):
         obs = env.reset()
         done = False
         total_reward = 0.0
         length = 0
+        any_success = False
 
         while not done:
             action = _predict_action(model, obs, env)
@@ -59,9 +61,12 @@ def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
             done = bool(dones[0])
             total_reward += float(reward[0])
             length += 1
-
+            any_success = any_success or bool(infos[0].get('is_success', False))
             if done and infos[0].get('is_success', False):
-                success_count += 1
+                terminal_success_count += 1
+
+        if any_success:
+            success_count += 1
 
         rewards.append(total_reward)
         lengths.append(length)
@@ -73,6 +78,7 @@ def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
         'max_reward': float(np.max(rewards)),
         'mean_length': float(np.mean(lengths)),
         'success_rate': success_count / num_episodes,
+        'terminal_success_rate': terminal_success_count / num_episodes,
         'num_episodes': num_episodes,
         'all_rewards': [float(r) for r in rewards],
         'all_lengths': [int(l) for l in lengths],
@@ -82,6 +88,7 @@ def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
 
     print(f"   평균 보상: {results['mean_reward']:.2f} ± {results['std_reward']:.2f}")
     print(f"   성공률: {results['success_rate']:.3f}")
+    print(f"   종료 시 성공률: {results['terminal_success_rate']:.3f}")
     print(f"   평균 에피소드 길이: {results['mean_length']:.1f}")
 
     return results
@@ -156,6 +163,10 @@ def evaluate_experiment(
     env_name = exp_info.get('env_name', 'FrankaSlideDense-v0')
     algorithm = exp_info.get('algorithm', 'SAC')
     reward_scale = exp_info.get('config', {}).get('reward_scale', 0.1)
+    normalize_env = bool(exp_info.get('config', {}).get('normalize_env', True))
+    task_progress_features = bool(exp_info.get('config', {}).get('task_progress_features', False))
+    residual_guidance = bool(exp_info.get('config', {}).get('residual_guidance', False))
+    residual_action_scale = float(exp_info.get('config', {}).get('residual_action_scale', 0.1))
 
     print('\n📋 실험 정보:')
     print(f'   환경: {env_name}')
@@ -200,14 +211,18 @@ def evaluate_experiment(
         model_path = os.path.join(models_dir, f'{model_name}.zip')
         vec_normalize_path = _get_vecnormalize_path(models_dir, model_name)
 
+        use_normalize = bool(vec_normalize_path) or normalize_env
         eval_env = create_vec_env(
             env_name,
             n_envs=1,
-            normalize=True,
+            normalize=use_normalize,
             reward_scale=reward_scale,
             vec_normalize_path=vec_normalize_path,
             training=False,
             render_mode=None,
+            task_progress_features=task_progress_features,
+            residual_guidance=residual_guidance,
+            residual_action_scale=residual_action_scale,
         )
 
         if model_name == 'stage_0_random':
@@ -227,11 +242,14 @@ def evaluate_experiment(
             video_env = create_vec_env(
                 env_name,
                 n_envs=1,
-                normalize=True,
+                normalize=use_normalize,
                 reward_scale=reward_scale,
                 vec_normalize_path=vec_normalize_path,
                 training=False,
                 render_mode='rgb_array',
+                task_progress_features=task_progress_features,
+                residual_guidance=residual_guidance,
+                residual_action_scale=residual_action_scale,
             )
             stage_name = model_name.replace('stage_', '') if model_name.startswith('stage_') else model_name
             video_results = video_recorder.record_stage_episodes(

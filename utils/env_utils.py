@@ -7,7 +7,6 @@ import sys
 from typing import Optional
 
 import gymnasium as gym
-from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
@@ -15,13 +14,35 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from train.common.wrappers import RewardScalingWrapper, SuccessTrackingWrapper
+from train.common.wrappers import (
+    PickAndPlaceResidualGuidanceWrapper,
+    PickAndPlaceTaskProgressWrapper,
+    RewardScalingWrapper,
+    SuccessTrackingWrapper,
+)
 
 
-def create_env(env_name, render_mode=None, reward_scale=1.0, seed: Optional[int] = None):
+def is_pick_and_place_sparse(env_name: str) -> bool:
+    return ("PickAndPlace" in env_name) and ("Sparse" in env_name)
+
+
+def create_env(
+    env_name,
+    render_mode=None,
+    reward_scale=1.0,
+    seed: Optional[int] = None,
+    task_progress_features: bool = False,
+    residual_guidance: bool = False,
+    residual_action_scale: float = 0.1,
+):
     """환경 생성 (래퍼 적용)"""
-    raw = gym.make(env_name, render_mode=render_mode)
-    env = TimeLimit(raw, max_episode_steps=100)
+    env = gym.make(env_name, render_mode=render_mode)
+
+    if task_progress_features and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceTaskProgressWrapper(env)
+    if residual_guidance and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceResidualGuidanceWrapper(env, residual_scale=residual_action_scale)
+
     env = Monitor(env)
 
     if reward_scale != 1.0:
@@ -47,6 +68,9 @@ def create_vec_env(
     render_mode=None,
     seed: Optional[int] = None,
     start_method: str = "forkserver",
+    task_progress_features: bool = False,
+    residual_guidance: bool = False,
+    residual_action_scale: float = 0.1,
 ):
     """벡터화된 환경 생성"""
 
@@ -58,6 +82,9 @@ def create_vec_env(
                 render_mode=render_mode,
                 reward_scale=reward_scale,
                 seed=env_seed,
+                task_progress_features=task_progress_features,
+                residual_guidance=residual_guidance,
+                residual_action_scale=residual_action_scale,
             )
         return _init
 
@@ -70,7 +97,18 @@ def create_vec_env(
         if vec_normalize_path and os.path.exists(vec_normalize_path):
             vec_env = VecNormalize.load(vec_normalize_path, vec_env)
         else:
-            vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
+            norm_obs_keys = None
+            obs_space = vec_env.observation_space
+            if isinstance(obs_space, gym.spaces.Dict):
+                goal_keys = {"observation", "achieved_goal", "desired_goal"}
+                if goal_keys.issubset(set(obs_space.spaces.keys())):
+                    norm_obs_keys = ["observation"]
+            vec_env = VecNormalize(
+                vec_env,
+                norm_obs=True,
+                norm_reward=False,
+                norm_obs_keys=norm_obs_keys,
+            )
 
         vec_env.training = training
         if not training:

@@ -7,6 +7,7 @@ import os
 from collections import deque
 
 import numpy as np
+import torch
 from stable_baselines3.common.callbacks import BaseCallback
 
 
@@ -19,13 +20,16 @@ class TrainingCallback(BaseCallback):
         self.episode_rewards = []
         self.episode_lengths = []
         self.success_count = 0
+        self.any_success_count = 0
         self.episode_count = 0
         self.csv_file = os.path.join(config.log_dir, "training_log.csv")
 
         self.best_reward = float("-inf")
         self.recent_rewards = deque(maxlen=100)
         self.recent_successes = deque(maxlen=100)
+        self.recent_any_successes = deque(maxlen=100)
         self.recent_success_rate = 0.0
+        self.recent_any_success_rate = 0.0
 
         self.saved_stages = set()
         self.stage_timesteps = config.get_stage_timesteps()
@@ -38,10 +42,12 @@ class TrainingCallback(BaseCallback):
             writer = csv.writer(f)
             writer.writerow([
                 "Timestep", "Episode", "Reward", "Length",
-                "Success", "Success_Rate", "Best_Reward", "Stage", "Env_Index"
+                "Success", "Any_Success", "Success_Rate", "Any_Success_Rate",
+                "Best_Reward", "Stage", "Curriculum_Stage", "Curriculum_Progress", "Env_Index"
             ])
 
     def _on_step(self) -> bool:
+        self._clamp_entropy_coefficient()
         self._check_stage_save()
 
         dones = self.locals.get("dones", [])
@@ -53,6 +59,17 @@ class TrainingCallback(BaseCallback):
                     self._handle_episode_end(info, env_idx)
 
         return True
+
+    def _clamp_entropy_coefficient(self) -> None:
+        min_ent_coef = getattr(self.config, "min_ent_coef", None)
+        if min_ent_coef is None:
+            return
+        if not hasattr(self.model, "log_ent_coef") or self.model.log_ent_coef is None:
+            return
+
+        min_log_ent_coef = float(np.log(float(min_ent_coef)))
+        with torch.no_grad():
+            self.model.log_ent_coef.data.clamp_(min=min_log_ent_coef)
 
     def _on_training_end(self) -> None:
         self._flush_csv_buffer()
@@ -88,6 +105,7 @@ class TrainingCallback(BaseCallback):
                 best_reward=self.best_reward,
                 recent_rewards=np.array(list(self.recent_rewards), dtype=float),
                 recent_successes=np.array(list(self.recent_successes), dtype=int),
+                recent_any_successes=np.array(list(self.recent_any_successes), dtype=int),
             )
 
             self.saved_stages.add(stage_name)
@@ -100,17 +118,24 @@ class TrainingCallback(BaseCallback):
         episode_reward = info["episode"]["r"]
         episode_length = info["episode"]["l"]
         is_success = bool(info.get("is_success", False))
+        episode_any_success = bool(info.get("episode_any_success", is_success))
 
         self.episode_rewards.append(episode_reward)
         self.episode_lengths.append(episode_length)
         self.recent_rewards.append(episode_reward)
         self.recent_successes.append(int(is_success))
+        self.recent_any_successes.append(int(episode_any_success))
         self.episode_count += 1
 
         if is_success:
             self.success_count += 1
+        if episode_any_success:
+            self.any_success_count += 1
 
         self.recent_success_rate = float(np.mean(self.recent_successes)) if self.recent_successes else 0.0
+        self.recent_any_success_rate = (
+            float(np.mean(self.recent_any_successes)) if self.recent_any_successes else 0.0
+        )
 
         if episode_reward > self.best_reward:
             self.best_reward = episode_reward
@@ -123,7 +148,16 @@ class TrainingCallback(BaseCallback):
         if self.episode_count % self.print_every_episodes == 0:
             self._print_progress()
 
-        self._save_to_csv(episode_reward, episode_length, is_success, current_stage, env_idx)
+        self.logger.record("rollout/any_success_rate", self.recent_any_success_rate)
+        self._save_to_csv(
+            episode_reward,
+            episode_length,
+            is_success,
+            episode_any_success,
+            current_stage,
+            info,
+            env_idx,
+        )
 
     def _get_current_stage(self) -> str:
         current_timestep = self.num_timesteps
@@ -152,19 +186,26 @@ class TrainingCallback(BaseCallback):
             f"Reward: {self.episode_rewards[-1]:8.2f} | "
             f"Avg: {avg_reward:8.2f} | "
             f"Len: {avg_length:6.1f} | "
-            f"Success: {self.recent_success_rate:.3f}"
+            f"Success: {self.recent_success_rate:.3f} | "
+            f"AnySuccess: {self.recent_any_success_rate:.3f}"
         )
 
-    def _save_to_csv(self, episode_reward, episode_length, is_success, current_stage, env_idx):
+    def _save_to_csv(self, episode_reward, episode_length, is_success, any_success, current_stage, info, env_idx):
+        curriculum_stage = info.get("curriculum_stage", "")
+        curriculum_progress = info.get("curriculum_progress", "")
         self.csv_buffer.append([
             self.num_timesteps,
             self.episode_count,
             episode_reward,
             episode_length,
             is_success,
+            any_success,
             self.recent_success_rate,
+            self.recent_any_success_rate,
             self.best_reward,
             current_stage,
+            curriculum_stage,
+            curriculum_progress,
             env_idx,
         ])
         if len(self.csv_buffer) >= self.csv_flush_every:

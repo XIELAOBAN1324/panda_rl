@@ -25,7 +25,15 @@ if project_root not in sys.path:
 import panda_mujoco_gym  # noqa: F401
 from train.common.callbacks import TrainingCallback
 from train.common.config import SACConfig, _recommended_n_envs
-from train.common.wrappers import RewardScalingWrapper, SuccessTrackingWrapper
+from train.common.curriculum import SafePickAndPlaceCurriculumWrapper
+from train.common.expert_pickplace import ExpertDataset, collect_pickplace_expert_dataset
+from train.common.wrappers import (
+    PickAndPlaceResidualGuidanceWrapper,
+    PickAndPlaceTaskProgressWrapper,
+    PickAndPlaceDenseRewardWrapper,
+    RewardScalingWrapper,
+    SuccessTrackingWrapper,
+)
 
 
 CURRICULUM_REMOVED_WARNING = (
@@ -33,6 +41,40 @@ CURRICULUM_REMOVED_WARNING = (
     "reward/task mismatch on sparse training. The flag is ignored and full-task "
     "training will be used."
 )
+
+
+def print_pickplace_sparse_effective_config(config: SACConfig) -> None:
+    if not is_pick_and_place_sparse(config.env_name):
+        return
+
+    print("\n🧩 PickPlace Sparse 최종 설정")
+    print(f"  profile: {getattr(config, 'pickplace_profile', 'auto')}")
+    print(f"  n_envs: {config.n_envs}")
+    print(f"  reward_scale: {config.reward_scale}")
+    print(f"  normalize_env: {config.normalize_env}")
+    print(f"  her: {config.her}")
+    print(f"  n_sampled_goal: {config.n_sampled_goal}")
+    print(f"  goal_selection_strategy: {config.goal_selection_strategy}")
+    print(f"  learning_rate: {config.learning_rate}")
+    print(f"  batch_size: {config.batch_size}")
+    print(f"  learning_starts: {config.learning_starts}")
+    print(f"  gradient_steps: {config.gradient_steps}")
+    print(f"  gamma: {config.gamma}")
+    print(f"  tau: {config.tau}")
+    print(f"  use_sde: {config.use_sde}")
+    print(f"  action_noise_std: {config.action_noise_std}")
+    print(f"  ent_coef: {config.ent_coef}")
+    print(f"  target_entropy: {config.target_entropy}")
+    print(f"  min_ent_coef: {config.min_ent_coef}")
+    print(f"  dense_reward_shaping: {getattr(config, 'dense_reward_shaping', False)}")
+    print(f"  task_progress_features: {getattr(config, 'task_progress_features', False)}")
+    print(f"  residual_guidance: {getattr(config, 'residual_guidance', False)}")
+    print(f"  residual_action_scale: {getattr(config, 'residual_action_scale', 0.1)}")
+    print(f"  expert_demo_episodes: {getattr(config, 'expert_demo_episodes', 0)}")
+    print(f"  bc_pretrain_epochs: {getattr(config, 'bc_pretrain_epochs', 0)}")
+    print(f"  demo_prefill_passes: {getattr(config, 'demo_prefill_passes', 1)}")
+    print(f"  safe_curriculum: {config.safe_curriculum}")
+    print("  env terminate_on_success: False (fixed horizon with TimeLimit)")
 
 
 def configure_runtime(config: SACConfig) -> None:
@@ -72,8 +114,28 @@ def create_env(
     render_mode=None,
     reward_scale=1.0,
     seed: Optional[int] = None,
+    dense_reward_shaping: bool = False,
+    task_progress_features: bool = False,
+    residual_guidance: bool = False,
+    residual_action_scale: float = 0.1,
+    safe_curriculum: bool = False,
+    safe_curriculum_total_env_steps: Optional[int] = None,
 ):
     env = gym.make(env_name, render_mode=render_mode)
+
+    if task_progress_features and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceTaskProgressWrapper(env)
+    if residual_guidance and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceResidualGuidanceWrapper(env, residual_scale=residual_action_scale)
+
+    if dense_reward_shaping and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceDenseRewardWrapper(env)
+
+    if safe_curriculum and is_pick_and_place_sparse(env_name):
+        env = SafePickAndPlaceCurriculumWrapper(
+            env,
+            total_env_steps_target=safe_curriculum_total_env_steps or 1_000_000,
+        )
 
     if reward_scale != 1.0:
         env = RewardScalingWrapper(env, scale=reward_scale)
@@ -94,6 +156,12 @@ def create_vec_env(
     reward_scale=1.0,
     seed=None,
     start_method="forkserver",
+    dense_reward_shaping: bool = False,
+    task_progress_features: bool = False,
+    residual_guidance: bool = False,
+    residual_action_scale: float = 0.1,
+    safe_curriculum: bool = False,
+    safe_curriculum_total_env_steps: Optional[int] = None,
 ):
     def make_env(rank):
         def _init():
@@ -102,6 +170,12 @@ def create_vec_env(
                 env_name,
                 reward_scale=reward_scale,
                 seed=env_seed,
+                dense_reward_shaping=dense_reward_shaping,
+                task_progress_features=task_progress_features,
+                residual_guidance=residual_guidance,
+                residual_action_scale=residual_action_scale,
+                safe_curriculum=safe_curriculum,
+                safe_curriculum_total_env_steps=safe_curriculum_total_env_steps,
             )
 
         return _init
@@ -113,7 +187,20 @@ def create_vec_env(
         vec_env = SubprocVecEnv(env_fns, start_method=start_method)
 
     if normalize:
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
+        norm_obs_keys = None
+        obs_space = vec_env.observation_space
+        if isinstance(obs_space, gym.spaces.Dict):
+            goal_keys = {"observation", "achieved_goal", "desired_goal"}
+            if goal_keys.issubset(set(obs_space.spaces.keys())):
+                # For HER + GoalEnv, keep goals in raw coordinates to avoid
+                # reward relabeling mismatch inside replay buffer.
+                norm_obs_keys = ["observation"]
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=True,
+            norm_reward=False,
+            norm_obs_keys=norm_obs_keys,
+        )
     return vec_env
 
 
@@ -162,6 +249,169 @@ def create_sac_model(env, config: SACConfig):
     return model
 
 
+def initialize_sac_model(env, config: SACConfig):
+    model = create_sac_model(env, config)
+    if not config.init_model_path:
+        return model
+
+    print(f"🧬 초기 가중치 로드: {config.init_model_path}")
+    loaded_model = SAC.load(config.init_model_path, env=env, device=config.device)
+    model.set_parameters(loaded_model.get_parameters(), exact_match=False)
+    return model
+
+
+def _print_expert_dataset_stats(dataset: ExpertDataset) -> None:
+    print("🧑‍🏫 Expert demo 수집 완료")
+    print(f"  episodes: {len(dataset.episode_successes)}")
+    print(f"  transitions: {dataset.num_transitions}")
+    print(f"  episode success rate: {dataset.success_rate:.3f}")
+
+
+def collect_pickplace_demos_for_training(config: SACConfig) -> Optional[ExpertDataset]:
+    if int(getattr(config, "expert_demo_episodes", 0)) <= 0:
+        return None
+    if not is_pick_and_place_sparse(config.env_name):
+        return None
+
+    print("🧪 scripted expert trajectory 수집 중...")
+
+    def _env_fn():
+        return create_env(
+            config.env_name,
+            reward_scale=config.reward_scale,
+            dense_reward_shaping=getattr(config, "dense_reward_shaping", False),
+            task_progress_features=getattr(config, "task_progress_features", False),
+            residual_guidance=False,
+            residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            safe_curriculum=False,
+        )
+
+    dataset = collect_pickplace_expert_dataset(
+        _env_fn,
+        num_episodes=int(config.expert_demo_episodes),
+        seed_start=int(config.seed or 0),
+    )
+    _print_expert_dataset_stats(dataset)
+    return dataset
+
+
+def run_behavior_cloning_pretrain(model, dataset: ExpertDataset, config: SACConfig) -> None:
+    epochs = int(getattr(config, "bc_pretrain_epochs", 0))
+    if dataset is None or epochs <= 0 or dataset.num_transitions == 0:
+        return
+
+    batch_size = max(1, int(getattr(config, "bc_batch_size", 512)))
+    learning_rate = getattr(config, "bc_learning_rate", None) or config.learning_rate
+    optimizer = torch.optim.Adam(model.actor.parameters(), lr=float(learning_rate))
+
+    model.policy.set_training_mode(True)
+    indices = np.arange(dataset.num_transitions)
+
+    print("🎓 Actor behavior cloning pretrain 시작")
+    print(f"  epochs: {epochs}")
+    print(f"  batch_size: {batch_size}")
+    print(f"  learning_rate: {learning_rate}")
+
+    for epoch in range(epochs):
+        np.random.shuffle(indices)
+        epoch_losses = []
+        for start in range(0, dataset.num_transitions, batch_size):
+            batch_indices = indices[start:start + batch_size]
+            obs_batch = {
+                key: dataset.observations[key][batch_indices]
+                for key in dataset.observations
+            }
+            obs_tensor, _ = model.policy.obs_to_tensor(obs_batch)
+            mean_actions, log_std, kwargs = model.actor.get_action_dist_params(obs_tensor)
+            distribution = model.actor.action_dist.proba_distribution(mean_actions, log_std)
+            target_actions = torch.as_tensor(
+                dataset.actions[batch_indices],
+                device=mean_actions.device,
+            )
+            target_actions = torch.clamp(target_actions, -0.999, 0.999)
+            predicted_actions = torch.tanh(mean_actions)
+            bc_nll = -distribution.log_prob(target_actions).mean()
+            bc_mse = torch.nn.functional.mse_loss(predicted_actions, target_actions)
+            loss = bc_nll + 0.1 * bc_mse
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(float(loss.item()))
+
+        print(f"  epoch {epoch + 1:02d}/{epochs}: loss={np.mean(epoch_losses):.6f}")
+
+    model.policy.set_training_mode(False)
+
+
+def _replay_buffer_batch_indices(total: int, batch_size: int):
+    end = total - (total % batch_size)
+    for start in range(0, end, batch_size):
+        yield slice(start, start + batch_size)
+
+
+def prefill_replay_buffer_from_dataset(model, dataset: ExpertDataset) -> None:
+    if dataset is None or dataset.num_transitions == 0:
+        return
+    if not getattr(model, "replay_buffer", None):
+        return
+
+    buffer_envs = int(getattr(model, "n_envs", 1))
+    repeat_passes = max(1, int(getattr(model, "_demo_prefill_passes", 1)))
+    print(f"📚 replay buffer expert prefill 시작 (n_envs={buffer_envs}, passes={repeat_passes})")
+
+    added_transitions = 0
+    for _ in range(repeat_passes):
+        for batch_slice in _replay_buffer_batch_indices(dataset.num_transitions, buffer_envs):
+            obs_batch = {
+                key: dataset.observations[key][batch_slice]
+                for key in dataset.observations
+            }
+            next_obs_batch = {
+                key: dataset.next_observations[key][batch_slice]
+                for key in dataset.next_observations
+            }
+            action_batch = dataset.actions[batch_slice]
+            reward_batch = dataset.rewards[batch_slice]
+            done_batch = dataset.dones[batch_slice]
+            info_batch = dataset.infos[batch_slice]
+            model.replay_buffer.add(
+                obs_batch,
+                next_obs_batch,
+                action_batch,
+                reward_batch,
+                done_batch,
+                info_batch,
+            )
+            added_transitions += int(action_batch.shape[0])
+
+    print(f"  added transitions: {added_transitions}")
+
+
+def evaluate_manual_any_success(model, config: SACConfig, episodes: int = 10, seed_start: int = 10_000) -> float:
+    successes = 0
+    for episode_idx in range(max(int(episodes), 1)):
+        env = create_env(
+            config.env_name,
+            reward_scale=config.reward_scale,
+            dense_reward_shaping=False,
+            task_progress_features=getattr(config, "task_progress_features", False),
+            residual_guidance=getattr(config, "residual_guidance", False),
+            residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            safe_curriculum=False,
+        )
+        observation, _ = env.reset(seed=seed_start + episode_idx)
+        any_success = False
+        for _ in range(200):
+            action, _ = model.predict(observation, deterministic=True)
+            observation, _, terminated, truncated, info = env.step(action)
+            any_success = any_success or bool(info.get("is_success", False))
+            if terminated or truncated:
+                break
+        successes += int(any_success)
+        env.close()
+    return successes / max(int(episodes), 1)
+
+
 def _to_callback_frequency(target_steps: int, n_envs: int) -> int:
     return max(target_steps // max(n_envs, 1), 1)
 
@@ -185,6 +435,7 @@ def _make_summary(config, training_time, mean_reward, std_reward, training_callb
         "final_std_reward": float(std_reward),
         "best_reward": float(training_callback.best_reward),
         "final_success_rate": float(training_callback.recent_success_rate),
+        "final_any_success_rate": float(getattr(training_callback, "recent_any_success_rate", 0.0)),
         "total_episodes": int(training_callback.episode_count),
         "config": serializable_config,
     }
@@ -220,6 +471,12 @@ def train_sac(config: SACConfig):
         reward_scale=config.reward_scale,
         seed=config.seed,
         start_method=config.vec_env_start_method,
+        dense_reward_shaping=getattr(config, "dense_reward_shaping", False),
+        task_progress_features=getattr(config, "task_progress_features", False),
+        residual_guidance=getattr(config, "residual_guidance", False),
+        residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+        safe_curriculum=config.safe_curriculum,
+        safe_curriculum_total_env_steps=max(config.total_timesteps // max(config.n_envs, 1), 1),
     )
 
     eval_env = None
@@ -231,6 +488,11 @@ def train_sac(config: SACConfig):
             reward_scale=config.reward_scale,
             seed=config.seed,
             start_method=config.vec_env_start_method,
+            dense_reward_shaping=False,
+            task_progress_features=getattr(config, "task_progress_features", False),
+            residual_guidance=getattr(config, "residual_guidance", False),
+            residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            safe_curriculum=False,
         )
         if isinstance(eval_env, VecNormalize):
             eval_env.training = False
@@ -240,8 +502,22 @@ def train_sac(config: SACConfig):
     new_logger = configure(logger_path, ["stdout", "csv", "tensorboard"])
 
     print("\n🧠 SAC 모델 초기화...")
-    model = create_sac_model(env, config)
+    model = initialize_sac_model(env, config)
     model.set_logger(new_logger)
+    model._demo_prefill_passes = int(getattr(config, "demo_prefill_passes", 1))
+
+    expert_dataset = collect_pickplace_demos_for_training(config)
+    if expert_dataset is not None:
+        run_behavior_cloning_pretrain(model, expert_dataset, config)
+        if getattr(config, "prefill_replay_buffer", True):
+            prefill_replay_buffer_from_dataset(model, expert_dataset)
+        warmstart_success = evaluate_manual_any_success(
+            model,
+            config,
+            episodes=10,
+            seed_start=int(config.seed or 0) + 10_000,
+        )
+        print(f"🔍 BC warm-start any-success@10ep: {warmstart_success:.3f}")
 
     eval_freq = _to_callback_frequency(config.eval_freq, config.n_envs)
     checkpoint_freq = _to_callback_frequency(config.checkpoint_freq, config.n_envs)
@@ -314,6 +590,11 @@ def train_sac(config: SACConfig):
             reward_scale=config.reward_scale,
             seed=config.seed,
             start_method=config.vec_env_start_method,
+            dense_reward_shaping=False,
+            task_progress_features=getattr(config, "task_progress_features", False),
+            residual_guidance=getattr(config, "residual_guidance", False),
+            residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            safe_curriculum=False,
         )
         if isinstance(eval_env, VecNormalize):
             eval_env.training = False
@@ -344,29 +625,103 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
     if not is_pick_and_place_sparse(config.env_name):
         return config
 
+    profile = getattr(args, "pickplace_profile", "auto")
+    if profile == "auto":
+        profile = "strong"
+    config.pickplace_profile = profile
+    use_expert_demos = profile == "strong" and int(getattr(args, "expert_demo_episodes", 0)) <= 0
+    if int(getattr(args, "expert_demo_episodes", 0)) > 0:
+        use_expert_demos = True
+
     if args.reward_scale is None:
         config.reward_scale = 1.0
     if args.her is None:
-        config.her = True
+        config.her = False if use_expert_demos else True
     config.curriculum = False
+    if args.safe_curriculum is None:
+        config.safe_curriculum = profile == "strong"
+    else:
+        config.safe_curriculum = bool(args.safe_curriculum)
     if args.n_envs is None:
         config.n_envs = 1
+
+    if profile == "legacy":
+        if args.tau is None:
+            config.tau = 0.005
+        if args.learning_rate is None:
+            config.learning_rate = 3e-4
+        if args.batch_size is None:
+            config.batch_size = 512
+        if args.learning_starts is None:
+            config.learning_starts = 10_000
+        if args.gradient_steps is None:
+            config.gradient_steps = max(2, int(config.n_envs))
+        if args.gamma is None:
+            config.gamma = 0.98
+        if args.use_sde is None:
+            config.use_sde = False
+        if args.action_noise_std is None:
+            config.action_noise_std = 0.30
+        if args.ent_coef is None:
+            config.ent_coef = "auto_0.2"
+        if args.target_entropy is None:
+            config.target_entropy = "auto"
+        return config
+
+    # strong profile (default for pick-and-place sparse)
+    if args.tau is None:
+        config.tau = 0.005
     if args.learning_rate is None:
-        config.learning_rate = 3e-4
+        config.learning_rate = 1e-4 if use_expert_demos else 3e-4
     if args.batch_size is None:
         config.batch_size = 512
     if args.learning_starts is None:
-        config.learning_starts = 10_000
+        config.learning_starts = 0 if use_expert_demos else 20_000
     if args.gradient_steps is None:
-        config.gradient_steps = 2
+        # Keep enough critic updates for sparse HER.
+        config.gradient_steps = max(4, int(config.n_envs))
     if args.gamma is None:
         config.gamma = 0.98
     if args.use_sde is None:
         config.use_sde = False
     if args.action_noise_std is None:
-        config.action_noise_std = 0.30
+        config.action_noise_std = 0.10 if use_expert_demos else 0.20
     if args.ent_coef is None:
-        config.ent_coef = "auto_0.2"
+        config.ent_coef = "auto_0.2" if use_expert_demos else "auto_1.0"
+    if args.target_entropy is None:
+        # Keep higher exploration than SAC default (auto=-action_dim).
+        config.target_entropy = -1.0
+    if getattr(args, "min_ent_coef", None) is None:
+        config.min_ent_coef = 0.005 if use_expert_demos else 0.03
+    if getattr(args, "dense_reward_shaping", None) is None:
+        config.dense_reward_shaping = True
+    if getattr(args, "task_progress_features", None) is None:
+        config.task_progress_features = True
+    if getattr(args, "residual_guidance", None) is None:
+        config.residual_guidance = True
+    if args.normalize_env is None:
+        config.normalize_env = False
+    if args.safe_curriculum is None:
+        config.safe_curriculum = False
+    if config.dense_reward_shaping:
+        config.copy_info_dict = True
+    if use_expert_demos and args.expert_demo_episodes <= 0:
+        config.expert_demo_episodes = 64
+    if use_expert_demos and config.bc_learning_rate is None:
+        config.bc_learning_rate = 3e-4
+    if use_expert_demos and getattr(args, "demo_prefill_passes", 1) <= 1:
+        config.demo_prefill_passes = 8
+    if args.n_sampled_goal is None:
+        config.n_sampled_goal = 8
+    if args.goal_selection_strategy is None:
+        config.goal_selection_strategy = "future"
+
+    if config.n_envs > 8:
+        print(
+            "[WARN] FrankaPickAndPlaceSparse-v0 usually trains more reliably with "
+            "small n_envs (1-8). Current n_envs="
+            f"{config.n_envs}."
+        )
     return config
 
 
@@ -377,6 +732,16 @@ def main():
     parser.add_argument("--exp-name", type=str, default=None, help="실험 이름")
     parser.add_argument("--reward-scale", type=float, default=None, help="보상 스케일 (미지정시 환경별 기본값)")
     parser.add_argument("--n-envs", type=int, default=None, help="병렬 환경 개수")
+    parser.set_defaults(normalize_env=None)
+    parser.add_argument("--normalize-env", dest="normalize_env", action="store_true", help="VecNormalize observation normalization 사용")
+    parser.add_argument("--no-normalize-env", dest="normalize_env", action="store_false", help="VecNormalize 비활성화")
+    parser.set_defaults(task_progress_features=None)
+    parser.add_argument("--task-progress-features", dest="task_progress_features", action="store_true", help="pick-and-place 진행 상태 feature 추가")
+    parser.add_argument("--no-task-progress-features", dest="task_progress_features", action="store_false", help="pick-and-place 진행 상태 feature 비활성화")
+    parser.set_defaults(residual_guidance=None)
+    parser.add_argument("--residual-guidance", dest="residual_guidance", action="store_true", help="expert hint 위에 residual action 을 학습")
+    parser.add_argument("--no-residual-guidance", dest="residual_guidance", action="store_false", help="residual guidance 비활성화")
+    parser.add_argument("--residual-action-scale", type=float, default=0.1, help="residual guidance action scale")
     parser.add_argument("--seed", type=int, default=None, help="난수 시드")
     parser.add_argument("--device", type=str, default="auto", help="학습 디바이스 (auto/cpu/cuda/cuda:0)")
     parser.add_argument("--torch-threads", type=int, default=8, help="torch intra-op threads")
@@ -388,6 +753,7 @@ def main():
     parser.add_argument("--save-replay-buffer", action="store_true", help="체크포인트에 replay buffer 저장")
     parser.add_argument("--no-eval", action="store_true", help="학습 중 평가 비활성화")
     parser.add_argument("--progress-bar", action="store_true", help="progress bar 표시")
+    parser.add_argument("--init-model-path", type=str, default=None, help="초기 가중치로 사용할 기존 SAC 모델 경로")
     parser.add_argument("--policy-width", type=int, default=256, help="정책/가치망 hidden width")
     parser.add_argument("--policy-depth", type=int, default=2, help="정책/가치망 hidden depth")
     parser.add_argument("--batch-size", type=int, default=None, help="SAC batch size")
@@ -395,16 +761,38 @@ def main():
     parser.add_argument("--learning-starts", type=int, default=None, help="random exploration steps before learning")
     parser.add_argument("--gradient-steps", type=int, default=None, help="gradient steps per rollout step")
     parser.add_argument("--gamma", type=float, default=None, help="discount factor")
+    parser.add_argument("--tau", type=float, default=None, help="target network soft update coefficient")
     parser.add_argument("--action-noise-std", type=float, default=None, help="normal action noise std when gSDE is disabled")
     parser.add_argument("--ent-coef", type=str, default=None, help="entropy coefficient, e.g. auto or auto_0.2")
+    parser.add_argument("--target-entropy", type=str, default=None, help="target entropy, e.g. auto or -2.0")
+    parser.add_argument("--min-ent-coef", type=float, default=None, help="auto entropy coefficient lower bound")
+    parser.add_argument("--expert-demo-episodes", type=int, default=0, help="scripted expert demo episode 수")
+    parser.add_argument("--bc-epochs", type=int, default=0, help="expert demo 로 actor behavior cloning pretrain epoch 수")
+    parser.add_argument("--bc-batch-size", type=int, default=512, help="behavior cloning batch size")
+    parser.add_argument("--bc-learning-rate", type=float, default=None, help="behavior cloning learning rate")
+    parser.add_argument("--no-demo-prefill", action="store_true", help="expert demo replay buffer prefill 비활성화")
+    parser.add_argument("--demo-prefill-passes", type=int, default=1, help="expert demo replay buffer 반복 적재 횟수")
+    parser.set_defaults(dense_reward_shaping=None)
+    parser.add_argument("--dense-reward-shaping", dest="dense_reward_shaping", action="store_true", help="sparse pick-and-place 학습 시 dense shaping reward 사용")
+    parser.add_argument("--no-dense-reward-shaping", dest="dense_reward_shaping", action="store_false", help="dense shaping reward 비활성화")
+    parser.add_argument(
+        "--pickplace-profile",
+        type=str,
+        default="auto",
+        choices=["auto", "strong", "legacy"],
+        help="FrankaPickAndPlaceSparse-v0 전용 preset (auto는 strong과 동일)",
+    )
     parser.add_argument("--no-tf32", action="store_true", help="Ampere 이상 GPU 의 TF32 비활성화")
 
     parser.set_defaults(her=None, curriculum=None, use_sde=None)
     parser.add_argument("--her", dest="her", action="store_true", help="HER replay buffer 사용")
     parser.add_argument("--no-her", dest="her", action="store_false", help="HER replay buffer 비활성화")
-    parser.add_argument("--n-sampled-goal", type=int, default=4, help="HER sampled goal 수")
-    parser.add_argument("--goal-selection-strategy", type=str, default="future", choices=["future", "final", "episode"], help="HER goal relabeling 전략")
+    parser.add_argument("--n-sampled-goal", type=int, default=None, help="HER sampled goal 수 (미지정시 preset/기본값 사용)")
+    parser.add_argument("--goal-selection-strategy", type=str, default=None, choices=["future", "final", "episode"], help="HER goal relabeling 전략 (미지정시 preset/기본값 사용)")
     parser.add_argument("--copy-info-dict", action="store_true", help="HER reward recompute 시 info dict 복사")
+    parser.set_defaults(safe_curriculum=None)
+    parser.add_argument("--safe-curriculum", dest="safe_curriculum", action="store_true", help="PickPlace sparse에서 reward/termination은 유지한 채 reset 분포만 단계적으로 완화")
+    parser.add_argument("--no-safe-curriculum", dest="safe_curriculum", action="store_false", help="safe curriculum 비활성화")
 
     parser.add_argument("--curriculum", dest="curriculum", action="store_true", help="deprecated: ignored, curriculum has been removed")
     parser.add_argument("--no-curriculum", dest="curriculum", action="store_false", help="deprecated: ignored, curriculum has been removed")
@@ -421,6 +809,7 @@ def main():
         env_name=args.env,
         total_timesteps=args.timesteps,
         experiment_name=args.exp_name,
+        normalize_env=True if args.normalize_env is None else args.normalize_env,
         reward_scale=args.reward_scale if args.reward_scale is not None else 0.1,
         n_envs=args.n_envs if args.n_envs is not None else _recommended_n_envs(),
         seed=args.seed,
@@ -441,18 +830,34 @@ def main():
         learning_starts=args.learning_starts if args.learning_starts is not None else 5_000,
         gradient_steps=args.gradient_steps if args.gradient_steps is not None else 1,
         gamma=args.gamma if args.gamma is not None else 0.95,
+        tau=args.tau if args.tau is not None else 0.05,
         action_noise_std=args.action_noise_std if args.action_noise_std is not None else 0.2,
         ent_coef=args.ent_coef if args.ent_coef is not None else "auto",
+        target_entropy=args.target_entropy if args.target_entropy is not None else "auto",
+        min_ent_coef=args.min_ent_coef,
         use_sde=True if args.use_sde is None else args.use_sde,
         her=False if args.her is None else args.her,
-        n_sampled_goal=args.n_sampled_goal,
-        goal_selection_strategy=args.goal_selection_strategy,
+        n_sampled_goal=args.n_sampled_goal if args.n_sampled_goal is not None else 4,
+        goal_selection_strategy=args.goal_selection_strategy if args.goal_selection_strategy is not None else "future",
         copy_info_dict=args.copy_info_dict,
         curriculum=False,
         enable_tf32=not args.no_tf32,
+        dense_reward_shaping=False if args.dense_reward_shaping is None else args.dense_reward_shaping,
+        safe_curriculum=False,
+        task_progress_features=False if args.task_progress_features is None else args.task_progress_features,
+        residual_guidance=False if args.residual_guidance is None else args.residual_guidance,
+        residual_action_scale=args.residual_action_scale,
+        init_model_path=args.init_model_path,
+        expert_demo_episodes=args.expert_demo_episodes,
+        bc_pretrain_epochs=args.bc_epochs,
+        bc_batch_size=args.bc_batch_size,
+        bc_learning_rate=args.bc_learning_rate,
+        prefill_replay_buffer=not args.no_demo_prefill,
+        demo_prefill_passes=args.demo_prefill_passes,
     )
 
     config = apply_pickplace_sparse_defaults(config, args)
+    print_pickplace_sparse_effective_config(config)
 
     train_sac(config)
     print("\n" + "=" * 60)

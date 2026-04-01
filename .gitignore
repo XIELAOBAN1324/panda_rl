@@ -2,6 +2,7 @@ __pycache__/
 # Ignore all ZIP archives
 *.zip
 *.pyc
-
+.codex
 # Ignore output and lower file
 outputs/
+fix.txt

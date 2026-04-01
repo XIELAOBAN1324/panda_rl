@@ -29,6 +29,7 @@ class FrankaEnv(MujocoRobotEnv):
         n_substeps: int = 50,
         reward_type: str = "sparse",
         block_gripper: bool = False,
+        terminate_on_success: bool = False,
         distance_threshold: float = 0.05,
         goal_xy_range: float = 0.3,
         obj_xy_range: float = 0.3,
@@ -37,6 +38,7 @@ class FrankaEnv(MujocoRobotEnv):
         **kwargs,
     ):
         self.block_gripper = block_gripper
+        self.terminate_on_success = bool(terminate_on_success)
         self.model_path = model_path
 
         action_size = 3
@@ -140,7 +142,7 @@ class FrankaEnv(MujocoRobotEnv):
             "ee_object_distance": float(np.linalg.norm(ee_position - achieved_goal)),
             "object_height": float(achieved_goal[2] - self.initial_object_height),
         }
-        terminated = bool(info["is_success"])
+        terminated = bool(info["is_success"]) if self.terminate_on_success else False
         truncated = bool(self.compute_truncated(achieved_goal, self.goal, info))
         reward = self.compute_reward(achieved_goal, self.goal, info)
 
@@ -290,6 +292,14 @@ class FrankaEnv(MujocoRobotEnv):
         assert goal_a.shape == goal_b.shape
         return np.linalg.norm(goal_a - goal_b, axis=-1)
 
+    def get_object_position(self) -> np.ndarray:
+        return self._utils.get_site_xpos(self.model, self.data, "obj_site").copy()
+
+    def minimum_goal_object_distance(self) -> float:
+        if self.reward_type != "sparse":
+            return 0.0
+        return float(self.distance_threshold + 0.02)
+
     def set_mocap_pose(self, position, orientation) -> None:
         self._utils.set_mocap_pos(self.model, self.data, "panda_mocap", position)
         self._utils.set_mocap_quat(self.model, self.data, "panda_mocap", orientation)
@@ -304,16 +314,30 @@ class FrankaEnv(MujocoRobotEnv):
             self._utils.set_joint_qpos(self.model, self.data, name, value)
 
     def _sample_goal(self) -> np.ndarray:
-        goal = np.array([0.0, 0.0, self.initial_object_height])
-        noise = self.np_random.uniform(self.goal_range_low, self.goal_range_high)
-        # for the pick and place task
-        if not self.block_gripper and self.goal_z_range > 0.0:
-            # 대부분은 탁자 위 목표를 유지하고, 일부만 공중 목표로 둔다.
-            # pick-and-place 초기 학습 난이도를 과도하게 높이지 않기 위함이다.
-            if self.np_random.random() < 0.7:
-                noise[2] = 0.0
-        goal += noise
-        return goal
+        object_position = self.get_object_position()
+        min_distance = self.minimum_goal_object_distance()
+        goal_dtype = object_position.dtype
+
+        best_goal = None
+        best_distance = float("-inf")
+
+        for _ in range(64):
+            goal = np.array([0.0, 0.0, self.initial_object_height], dtype=np.float64)
+            noise = self.np_random.uniform(self.goal_range_low, self.goal_range_high)
+            if not self.block_gripper and self.goal_z_range > 0.0:
+                if self.np_random.random() < 0.7:
+                    noise[2] = 0.0
+            goal += noise
+
+            distance = float(np.linalg.norm(goal - object_position))
+            if distance > best_distance:
+                best_goal = goal.copy()
+                best_distance = distance
+
+            if distance >= min_distance:
+                return goal.astype(goal_dtype)
+
+        return np.asarray(best_goal, dtype=goal_dtype)
 
     def _sample_object(self) -> None:
         object_position = np.array([0.0, 0.0, self.initial_object_height])

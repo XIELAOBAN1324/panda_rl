@@ -1,33 +1,14 @@
-#训练 : train_sac.py
-conda activate panda_rl
-cd ~/panda_mujoco_gym
-python train/train_sac.py
--------------------------------------------------------------------------------------------
-#训练中查看 tensorboard
-conda activate panda_rl
-cd ~/panda_mujoco_gym
-tensorboard --logdir outputs/
--------------------------------------------------------------------------------------------
-#查看 GPU 负载
-watch -n 1 nvidia-smi
--------------------------------------------------------------------------------------------
-#查看 CPU 负载
-htop
--------------------------------------------------------------------------------------------
-#评估最新模型并生成视频
-conda activate panda_rl
-cd ~/panda_mujoco_gym
-python evaluate/evaluate_with_video.py --latest
--------------------------------------------------------------------------------------------
-#评估特定 outputs 生成的模型并生成视频
-conda activate panda_rl
-cd ~/panda_mujoco_gym
-export MUJOCO_GL=egl
-python evaluate/evaluate_with_video.py --exp-dir /home/dyros/panda_mujoco_gym/outputs/FrankaSlideDense-v0_SAC_20250720_235112
+#实验复现
+python train/train_sac.py \
+  --env FrankaPickAndPlaceSparse-v0 \
+  --timesteps 100000 \
+  --exp-name scratch_from_random_100k \
+  --n-envs 4 \
+  --seed 0 \
+  --eval-freq 10000 \
+  --checkpoint-freq 100000 \
+  --device cuda:0
 
-# todo : 创建用于训练 sac、ppo、ddpg、td3 等 on-policy 和 off-policy 的 Python 文件，
-# 并修改相应代码以加载匹配的环境（例如：push、slide、pickandplace）。
--------------------------------------------------------------------------------------------
 #panda_mujoco_gym 的目录结构
 /home/dyros/panda_mujoco_gym/
 ├── train/

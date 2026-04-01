@@ -111,6 +111,7 @@ class SACConfig(BaseConfig):
     gradient_steps: int = 1
     ent_coef: Union[str, float] = "auto"
     target_entropy: Union[str, float] = "auto"
+    min_ent_coef: Optional[float] = None
 
     # 네트워크 구조
     policy_width: int = 256
@@ -135,9 +136,20 @@ class SACConfig(BaseConfig):
     # Curriculum (하위 호환용 no-op)
     curriculum: bool = False
     curriculum_total_env_steps: Optional[int] = None
+    dense_reward_shaping: bool = False
+    safe_curriculum: bool = False
+    task_progress_features: bool = False
+    residual_guidance: bool = False
+    residual_action_scale: float = 0.1
 
     # 선택적 warm-start
     init_model_path: Optional[str] = None
+    expert_demo_episodes: int = 0
+    bc_pretrain_epochs: int = 0
+    bc_batch_size: int = 512
+    bc_learning_rate: Optional[float] = None
+    prefill_replay_buffer: bool = True
+    demo_prefill_passes: int = 1
 
     # 학습 단계 정의 (비디오 녹화용)
     stages: Dict[str, float] = field(default_factory=lambda: {
