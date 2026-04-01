@@ -1,4 +1,4 @@
-"""Pick-and-place sparse 학습용 curriculum wrappers."""
+"""用于 pick-and-place sparse 训练的 curriculum 包装器。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,14 +27,14 @@ class CurriculumStage:
 
 
 class PickAndPlaceCurriculumWrapper(gym.Wrapper):
-    """FrankaPickAndPlaceSparse를 더 쉽게 시작시키는 aggressive curriculum.
+    """用于让 FrankaPickAndPlaceSparse 更容易起步的激进 curriculum。
 
-    핵심 아이디어
-    - 초기에는 object spawn 범위를 좁힌다.
-    - 초기에는 goal 을 object 근처/위쪽에 두어 '잡고 살짝 들기'를 먼저 학습시킨다.
-    - episode 시작 시 EE를 object 위로 옮겨 초기 탐색 난이도를 크게 낮춘다.
-    - sparse reward 위에 작은 shaping bonus 를 얹되, 진행될수록 0으로 감쇠시킨다.
-    - 마지막 stage 에서는 원래 full task 분포와 원래 sparse reward로 돌아간다.
+    核心思路
+    - 初始阶段缩小 object spawn 范围。
+    - 初始阶段将 goal 放在 object 附近或上方，先学会“抓取并轻轻抬起”。
+    - 在 episode 开始时把 EE 移到 object 上方，大幅降低初始探索难度。
+    - 在 sparse reward 之上叠加少量 shaping bonus，并随着训练推进衰减到 0。
+    - 最后一个 stage 恢复为原始 full task 分布和原始 sparse reward。
     """
 
     def __init__(self, env: gym.Env, total_env_steps_target: int = 1_000_000):
@@ -254,7 +254,7 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
             info["curriculum_stage"] = self.current_stage.name
             info["curriculum_progress"] = self._progress()
 
-        # sparse pick-and-place 에만 쓰는 보너스. 마지막 stage 에서는 자동으로 0.
+        # 仅用于 sparse pick-and-place 的奖励 bonus，在最后一个 stage 会自动变为 0。
         shaping_bonus = self._compute_shaping_bonus(obs)
         reward = float(reward) + shaping_bonus
 
@@ -282,12 +282,12 @@ class SafeCurriculumStage:
 
 
 class SafePickAndPlaceCurriculumWrapper(gym.Wrapper):
-    """Reward/termination semantics를 바꾸지 않는 안전한 curriculum.
+    """不改变 reward/termination 语义的安全 curriculum。
 
-    원칙
-    - reward 를 절대 수정하지 않는다.
-    - success 조건/termination 조건을 수정하지 않는다.
-    - reset 시점의 object/goal 분포만 단계적으로 넓힌다.
+    原则
+    - 绝不修改 reward。
+    - 不修改 success 条件和 termination 条件。
+    - 只在 reset 时逐步扩大 object/goal 的分布。
     """
 
     def __init__(self, env: gym.Env, total_env_steps_target: int = 1_000_000):

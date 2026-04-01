@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-모델 평가 및 비디오 생성 통합 스크립트
+模型评估与视频生成一体化脚本
 """
 
 import os
@@ -35,13 +35,13 @@ def _predict_action(model, obs, env):
 
 
 def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
-    """모델 또는 랜덤 정책 성능 평가.
+    """评估模型或随机策略的性能。
 
-    evaluate_policy()는 성공률이나 개별 rollout 통계를 직접 제공하지 않으므로,
-    여기서는 모델/랜덤 정책 모두 동일한 수동 rollout 경로로 평가한다.
+    evaluate_policy() 不会直接提供成功率或单次 rollout 统计，
+    这里对模型和随机策略都使用相同的手动 rollout 路径进行评估。
     """
-    policy_name = '랜덤 정책' if model is None else '모델'
-    print(f"\n📊 {policy_name} 성능 평가 중... ({num_episodes}개 에피소드)")
+    policy_name = '随机策略' if model is None else '模型'
+    print(f"\n📊 正在评估{policy_name}性能...（{num_episodes}个回合）")
 
     rewards = []
     lengths = []
@@ -86,10 +86,10 @@ def evaluate_model_performance(model, env, num_episodes: int = 50) -> Dict:
         'rollout_mean_length': float(np.mean(lengths)),
     }
 
-    print(f"   평균 보상: {results['mean_reward']:.2f} ± {results['std_reward']:.2f}")
-    print(f"   성공률: {results['success_rate']:.3f}")
-    print(f"   종료 시 성공률: {results['terminal_success_rate']:.3f}")
-    print(f"   평균 에피소드 길이: {results['mean_length']:.1f}")
+    print(f"   平均奖励: {results['mean_reward']:.2f} ± {results['std_reward']:.2f}")
+    print(f"   成功率: {results['success_rate']:.3f}")
+    print(f"   终止时成功率: {results['terminal_success_rate']:.3f}")
+    print(f"   平均回合长度: {results['mean_length']:.1f}")
 
     return results
 
@@ -152,35 +152,40 @@ def evaluate_experiment(
     create_highlights: bool = True,
 ) -> Dict:
     print('=' * 60)
-    print('🔍 실험 평가 시작')
-    print(f'📁 실험 디렉토리: {exp_dir}')
+    print('🔍 开始评估实验')
+    print(f'📁 实验目录: {exp_dir}')
     print('=' * 60)
 
     exp_info = get_experiment_info(exp_dir)
     if not exp_info:
-        raise ValueError(f'실험 정보를 찾을 수 없습니다: {exp_dir}')
+        raise ValueError(f'找不到实验信息: {exp_dir}')
 
     env_name = exp_info.get('env_name', 'FrankaSlideDense-v0')
     algorithm = exp_info.get('algorithm', 'SAC')
     reward_scale = exp_info.get('config', {}).get('reward_scale', 0.1)
     normalize_env = bool(exp_info.get('config', {}).get('normalize_env', True))
+    dense_reward_shaping = bool(exp_info.get('config', {}).get('dense_reward_shaping', False))
+    dense_reward_style = str(exp_info.get('config', {}).get('dense_reward_style', 'standard'))
+    task_geometry_features = bool(exp_info.get('config', {}).get('task_geometry_features', False))
+    task_stage_features = bool(exp_info.get('config', {}).get('task_stage_features', False))
     task_progress_features = bool(exp_info.get('config', {}).get('task_progress_features', False))
+    expert_hint_style = str(exp_info.get('config', {}).get('expert_hint_style', 'staged'))
     residual_guidance = bool(exp_info.get('config', {}).get('residual_guidance', False))
     residual_action_scale = float(exp_info.get('config', {}).get('residual_action_scale', 0.1))
 
-    print('\n📋 실험 정보:')
-    print(f'   환경: {env_name}')
-    print(f'   알고리즘: {algorithm}')
-    print(f'   보상 스케일: {reward_scale}')
-    print(f"   총 학습 스텝: {exp_info.get('total_timesteps', 'Unknown')}")
+    print('\n📋 实验信息:')
+    print(f'   环境: {env_name}')
+    print(f'   算法: {algorithm}')
+    print(f'   奖励缩放: {reward_scale}')
+    print(f"   总训练步数: {exp_info.get('total_timesteps', 'Unknown')}")
 
     models_dir = os.path.join(exp_dir, 'models')
     available_models = exp_info.get('available_models', [])
     if not available_models:
-        raise ValueError(f'모델을 찾을 수 없습니다: {models_dir}')
+        raise ValueError(f'找不到模型: {models_dir}')
 
     stage_models = _build_stage_model_list(available_models, stages)
-    print(f'\n📦 평가할 모델 ({len(stage_models)}개):')
+    print(f'\n📦 待评估模型（{len(stage_models)}个）:')
     for model_name in stage_models:
         print(f'   - {model_name}')
 
@@ -205,7 +210,7 @@ def evaluate_experiment(
 
     for model_name in stage_models:
         print(f"\n{'=' * 50}")
-        print(f'🎯 평가 중: {model_name}')
+        print(f'🎯 正在评估: {model_name}')
         print(f"{'=' * 50}")
 
         model_path = os.path.join(models_dir, f'{model_name}.zip')
@@ -220,19 +225,24 @@ def evaluate_experiment(
             vec_normalize_path=vec_normalize_path,
             training=False,
             render_mode=None,
+            dense_reward_shaping=dense_reward_shaping,
+            dense_reward_style=dense_reward_style,
+            task_geometry_features=task_geometry_features,
+            task_stage_features=task_stage_features,
             task_progress_features=task_progress_features,
+            expert_hint_style=expert_hint_style,
             residual_guidance=residual_guidance,
             residual_action_scale=residual_action_scale,
         )
 
         if model_name == 'stage_0_random':
             model = None
-            print('   🎲 Random Policy 사용')
+            print('   🎲 使用随机策略')
         else:
             model = load_model(model_path, algorithm=algorithm, env=eval_env)
-            print('   ✅ 모델 로드 완료')
+            print('   ✅ 模型加载完成')
             if vec_normalize_path:
-                print(f'   📦 정규화 통계: {os.path.basename(vec_normalize_path)}')
+                print(f'   📦 归一化统计信息: {os.path.basename(vec_normalize_path)}')
 
         performance = evaluate_model_performance(model, eval_env, num_eval_episodes)
         all_results['model_performances'][model_name] = performance
@@ -247,7 +257,12 @@ def evaluate_experiment(
                 vec_normalize_path=vec_normalize_path,
                 training=False,
                 render_mode='rgb_array',
+                dense_reward_shaping=dense_reward_shaping,
+                dense_reward_style=dense_reward_style,
+                task_geometry_features=task_geometry_features,
+                task_stage_features=task_stage_features,
                 task_progress_features=task_progress_features,
+                expert_hint_style=expert_hint_style,
                 residual_guidance=residual_guidance,
                 residual_action_scale=residual_action_scale,
             )
@@ -272,43 +287,43 @@ def evaluate_experiment(
     save_json(all_results, results_path)
 
     print('\n' + '=' * 60)
-    print('✅ 평가 완료!')
-    print(f'📊 결과 저장: {results_path}')
+    print('✅ 评估完成！')
+    print(f'📊 结果已保存: {results_path}')
     if record_video:
-        print(f"🎥 비디오 저장: {os.path.join(evaluation_dir, 'videos')}")
+        print(f"🎥 视频已保存: {os.path.join(evaluation_dir, 'videos')}")
     print('=' * 60)
     return all_results
 
 
 def main():
-    parser = argparse.ArgumentParser(description='모델 평가 및 비디오 생성')
+    parser = argparse.ArgumentParser(description='模型评估与视频生成')
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--exp-dir', type=str, help='실험 디렉토리 경로')
-    group.add_argument('--latest', action='store_true', help='가장 최근 실험 평가')
+    group.add_argument('--exp-dir', type=str, help='实验目录路径')
+    group.add_argument('--latest', action='store_true', help='评估最近的实验')
 
     parser.add_argument('--stages', type=str, nargs='+', default=None,
-                        help="평가할 단계 (예: 0_random 1_20percent final) 또는 'all'")
+                        help="要评估的阶段（例如：0_random 1_20percent final）或 'all'")
     parser.add_argument('--num-eval', type=int, default=50,
-                        help='성능 평가 에피소드 수 (기본: 50)')
+                        help='性能评估回合数（默认：50）')
     parser.add_argument('--num-video', type=int, default=3,
-                        help='각 단계별 비디오 에피소드 수 (기본: 3)')
+                        help='每个阶段的视频回合数（默认：3）')
     parser.add_argument('--no-video', action='store_true',
-                        help='비디오 녹화 비활성화')
+                        help='禁用视频录制')
     parser.add_argument('--no-highlights', action='store_true',
-                        help='하이라이트 생성 비활성화')
+                        help='禁用高光生成')
 
     args = parser.parse_args()
 
     if args.latest:
         exp_dir = find_latest_experiment()
         if exp_dir is None:
-            print('❌ 최근 실험을 찾을 수 없습니다.')
+            print('❌ 找不到最近的实验。')
             return
-        print(f'📁 최신 실험 발견: {exp_dir}')
+        print(f'📁 发现最新实验: {exp_dir}')
     else:
         exp_dir = args.exp_dir
         if not os.path.exists(exp_dir):
-            print(f'❌ 실험 디렉토리를 찾을 수 없습니다: {exp_dir}')
+            print(f'❌ 找不到实验目录: {exp_dir}')
             return
 
     try:
@@ -321,16 +336,16 @@ def main():
             create_highlights=not args.no_highlights,
         )
 
-        print('\n📈 평가 결과 요약:')
+        print('\n📈 评估结果摘要:')
         for model_name, perf in results['model_performances'].items():
             if 'mean_reward' in perf:
                 print(
-                    f"   {model_name}: 보상 {perf['mean_reward']:.2f} ± {perf['std_reward']:.2f}, "
-                    f"성공률 {perf['success_rate']:.3f}"
+                    f"   {model_name}: 奖励 {perf['mean_reward']:.2f} ± {perf['std_reward']:.2f}, "
+                    f"成功率 {perf['success_rate']:.3f}"
                 )
 
     except Exception as e:
-        print(f'❌ 평가 중 오류 발생: {e}')
+        print(f'❌ 评估时发生错误: {e}')
         import traceback
         traceback.print_exc()
 

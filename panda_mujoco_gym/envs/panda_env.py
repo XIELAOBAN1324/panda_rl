@@ -155,8 +155,8 @@ class FrankaEnv(MujocoRobotEnv):
 
         reward = -d
 
-        # Pick-and-place 계열은 목표 거리만으로는 탐색이 매우 어려워서,
-        # 도달(reach)과 리프트(lift) 신호를 약하게 추가한다.
+        # 对于 pick-and-place 类任务，仅靠目标距离几乎无法探索，
+        # 因此额外加入较弱的 reach 和 lift 信号。
         if not self.block_gripper:
             ee_object_distance = float(info.get("ee_object_distance", 0.0))
             object_height = max(float(info.get("object_height", 0.0)), 0.0)

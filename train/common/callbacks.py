@@ -1,5 +1,5 @@
 """
-학습 콜백 클래스 (통계/저장/IO 개선판)
+训练回调类（统计/保存/IO 改进版）
 """
 
 import csv
@@ -12,7 +12,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 
 class TrainingCallback(BaseCallback):
-    """학습 진행 상황 추적 콜백"""
+    """跟踪训练进度的回调"""
 
     def __init__(self, config, verbose=0):
         super().__init__(verbose)
@@ -109,7 +109,7 @@ class TrainingCallback(BaseCallback):
             )
 
             self.saved_stages.add(stage_name)
-            print(f"💾 단계 저장: {stage_name} (Step {current_timestep})")
+            print(f"💾 阶段已保存: {stage_name}（Step {current_timestep}）")
 
     def _handle_episode_end(self, info, env_idx: int):
         if "episode" not in info:
@@ -140,8 +140,8 @@ class TrainingCallback(BaseCallback):
         if episode_reward > self.best_reward:
             self.best_reward = episode_reward
             print(
-                f"🏆 새로운 최고 보상! {episode_reward:.2f} "
-                f"(최근 성공률: {self.recent_success_rate:.3f})"
+                f"🏆 新的最高奖励！{episode_reward:.2f} "
+                f"（最近成功率: {self.recent_success_rate:.3f}）"
             )
 
         current_stage = self._get_current_stage()

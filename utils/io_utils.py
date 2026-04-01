@@ -1,5 +1,5 @@
 """
-파일 입출력 유틸리티 함수들
+文件读写工具函数
 """
 
 import os
@@ -17,43 +17,43 @@ ALGORITHM_CLASSES = {
 
 
 def load_model(model_path: str, algorithm: str = 'SAC', env=None):
-    """저장된 모델 로드"""
+    """加载已保存的模型"""
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
+        raise FileNotFoundError(f"找不到模型文件: {model_path}")
 
     model_class = ALGORITHM_CLASSES.get(algorithm.upper())
     if model_class is None:
-        raise ValueError(f"지원하지 않는 알고리즘: {algorithm}")
+        raise ValueError(f"不支持的算法: {algorithm}")
 
     return model_class.load(model_path, env=env)
 
 
 def load_vec_normalize(vec_normalize_path: str, vec_env):
-    """VecNormalize 통계 로드"""
+    """加载 VecNormalize 统计信息"""
     if not os.path.exists(vec_normalize_path):
-        raise FileNotFoundError(f"VecNormalize 파일을 찾을 수 없습니다: {vec_normalize_path}")
+        raise FileNotFoundError(f"找不到 VecNormalize 文件: {vec_normalize_path}")
 
     return VecNormalize.load(vec_normalize_path, vec_env)
 
 
 def save_json(data: Dict[str, Any], filepath: str):
-    """JSON 파일 저장"""
+    """保存 JSON 文件"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4)
 
 
 def load_json(filepath: str) -> Dict[str, Any]:
-    """JSON 파일 로드"""
+    """加载 JSON 文件"""
     if not os.path.exists(filepath):
-        raise FileNotFoundError(f"JSON 파일을 찾을 수 없습니다: {filepath}")
+        raise FileNotFoundError(f"找不到 JSON 文件: {filepath}")
 
     with open(filepath, 'r') as f:
         return json.load(f)
 
 
 def get_experiment_info(exp_dir: str) -> Dict[str, Any]:
-    """실험 디렉토리에서 정보 추출"""
+    """从实验目录中提取信息"""
     info: Dict[str, Any] = {}
 
     summary_candidates = [
@@ -73,7 +73,7 @@ def get_experiment_info(exp_dir: str) -> Dict[str, Any]:
             if file.endswith('.zip'):
                 available_models.add(file.replace('.zip', ''))
 
-    # stage stats 만 존재하는 단계(예: stage_0_random)도 평가 대상에 포함
+    # 仅存在 stage stats 的阶段（例如 stage_0_random）也纳入评估范围
     logs_dir = os.path.join(exp_dir, 'logs')
     if os.path.exists(logs_dir):
         for file in os.listdir(logs_dir):
@@ -98,7 +98,7 @@ def get_experiment_info(exp_dir: str) -> Dict[str, Any]:
 
 
 def find_latest_experiment(base_dir: str = 'outputs', env_name: str = None) -> Optional[str]:
-    """가장 최근 실험 디렉토리 찾기"""
+    """查找最近的实验目录"""
     if not os.path.exists(base_dir):
         return None
 

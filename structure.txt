@@ -1,13 +1,6 @@
 #实验复现
-python train/train_sac.py \
-  --env FrankaPickAndPlaceSparse-v0 \
-  --timesteps 100000 \
-  --exp-name scratch_from_random_100k \
-  --n-envs 4 \
-  --seed 0 \
-  --eval-freq 10000 \
-  --checkpoint-freq 100000 \
-  --device cuda:0
+/home/lsy/.conda/envs/panda_rl/bin/python train/train_sac.py --env FrankaPickAndPlaceSparse-v0 --timesteps 20000 --exp-name gpu_directhint_residual_fixcheck_20k --pickplace-profile strong --dense-reward-style direct --expert-hint-style direct --expert-demo-style direct --residual-action-scale 0.05 --bc-epochs 4 --n-envs 4 --seed 0 --eval-freq 5000 --checkpoint-freq 20000 --device cuda:2
+
 
 #panda_mujoco_gym 的目录结构
 /home/dyros/panda_mujoco_gym/

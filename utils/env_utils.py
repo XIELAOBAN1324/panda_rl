@@ -1,5 +1,5 @@
 """
-환경 생성 유틸리티 함수들
+环境创建工具函数
 """
 
 import os
@@ -15,7 +15,10 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from train.common.wrappers import (
+    PickAndPlaceDenseRewardWrapper,
+    PickAndPlaceGeometryWrapper,
     PickAndPlaceResidualGuidanceWrapper,
+    PickAndPlaceStageFeatureWrapper,
     PickAndPlaceTaskProgressWrapper,
     RewardScalingWrapper,
     SuccessTrackingWrapper,
@@ -31,17 +34,28 @@ def create_env(
     render_mode=None,
     reward_scale=1.0,
     seed: Optional[int] = None,
+    dense_reward_shaping: bool = False,
+    dense_reward_style: str = "standard",
+    task_geometry_features: bool = False,
+    task_stage_features: bool = False,
     task_progress_features: bool = False,
+    expert_hint_style: str = "staged",
     residual_guidance: bool = False,
     residual_action_scale: float = 0.1,
 ):
-    """환경 생성 (래퍼 적용)"""
+    """创建环境（应用包装器）"""
     env = gym.make(env_name, render_mode=render_mode)
 
     if task_progress_features and is_pick_and_place_sparse(env_name):
-        env = PickAndPlaceTaskProgressWrapper(env)
+        env = PickAndPlaceTaskProgressWrapper(env, hint_style=expert_hint_style)
+    elif task_stage_features and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceStageFeatureWrapper(env, hint_style=expert_hint_style)
+    elif task_geometry_features and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceGeometryWrapper(env)
     if residual_guidance and is_pick_and_place_sparse(env_name):
         env = PickAndPlaceResidualGuidanceWrapper(env, residual_scale=residual_action_scale)
+    if dense_reward_shaping and is_pick_and_place_sparse(env_name):
+        env = PickAndPlaceDenseRewardWrapper(env, reward_style=dense_reward_style)
 
     env = Monitor(env)
 
@@ -68,11 +82,16 @@ def create_vec_env(
     render_mode=None,
     seed: Optional[int] = None,
     start_method: str = "forkserver",
+    dense_reward_shaping: bool = False,
+    dense_reward_style: str = "standard",
+    task_geometry_features: bool = False,
+    task_stage_features: bool = False,
     task_progress_features: bool = False,
+    expert_hint_style: str = "staged",
     residual_guidance: bool = False,
     residual_action_scale: float = 0.1,
 ):
-    """벡터화된 환경 생성"""
+    """创建向量化环境"""
 
     def make_env(rank: int):
         def _init():
@@ -82,7 +101,12 @@ def create_vec_env(
                 render_mode=render_mode,
                 reward_scale=reward_scale,
                 seed=env_seed,
+                dense_reward_shaping=dense_reward_shaping,
+                dense_reward_style=dense_reward_style,
+                task_geometry_features=task_geometry_features,
+                task_stage_features=task_stage_features,
                 task_progress_features=task_progress_features,
+                expert_hint_style=expert_hint_style,
                 residual_guidance=residual_guidance,
                 residual_action_scale=residual_action_scale,
             )

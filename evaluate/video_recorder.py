@@ -1,5 +1,5 @@
 """
-비디오 녹화 클래스들
+视频录制类
 """
 
 import os
@@ -12,7 +12,7 @@ import numpy as np
 
 
 def _to_json_safe(obj: Any):
-    """numpy 타입을 JSON 직렬화 가능한 파이썬 기본 타입으로 변환"""
+    """将 numpy 类型转换为可 JSON 序列化的 Python 基本类型"""
     if isinstance(obj, np.generic):
         return obj.item()
     if isinstance(obj, np.ndarray):
@@ -25,7 +25,7 @@ def _to_json_safe(obj: Any):
 
 
 class EpisodeVideoRecorder:
-    """에피소드별 개별 비디오 녹화 클래스"""
+    """按回合分别录制视频的类"""
 
     def __init__(self, save_dir: str, fps: int = 30):
         self.save_dir = save_dir
@@ -35,16 +35,16 @@ class EpisodeVideoRecorder:
         os.makedirs(save_dir, exist_ok=True)
 
     def start_episode_recording(self):
-        """새 에피소드 녹화 시작"""
+        """开始录制新回合"""
         self.current_episode_frames = []
 
     def add_frame(self, frame: np.ndarray):
-        """현재 에피소드에 프레임 추가"""
+        """向当前回合添加帧"""
         if frame is not None:
             self.current_episode_frames.append(frame.copy())
 
     def end_episode_recording(self, episode_info: Dict) -> Optional[str]:
-        """에피소드 녹화 종료 및 비디오 저장"""
+        """结束回合录制并保存视频"""
         if not self.current_episode_frames:
             return None
 
@@ -73,10 +73,10 @@ class EpisodeVideoRecorder:
             safe_info = _to_json_safe(safe_info)
             self.episode_metadata.append(safe_info)
 
-            print(f"   ✅ 비디오 저장: {filename}")
+            print(f"   ✅ 视频已保存: {filename}")
             print(
-                f"      프레임: {len(self.current_episode_frames)}, "
-                f"성공: {success_str}, 보상: {reward:.2f}"
+                f"      帧数: {len(self.current_episode_frames)}, "
+                f"成功: {success_str}, 奖励: {reward:.2f}"
             )
             return video_path
 
@@ -128,20 +128,20 @@ class EpisodeVideoRecorder:
             return proc.returncode == 0 and os.path.exists(video_path) and os.path.getsize(video_path) > 0
 
         except Exception as e:
-            print(f"❌ 保存视频错误: {e}")
+            print(f"❌ 保存视频出错: {e}")
             return False
 
     def save_metadata(self):
-        """에피소드 메타데이터를 JSON으로 저장"""
+        """将回合元数据保存为 JSON"""
         if self.episode_metadata:
             metadata_path = os.path.join(self.save_dir, "episode_metadata.json")
             with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(_to_json_safe(self.episode_metadata), f, indent=4, ensure_ascii=False)
-            print(f"   📝 메타데이터 저장: {metadata_path}")
+            print(f"   📝 元数据已保存: {metadata_path}")
 
 
 class StageVideoRecorder:
-    """학습 단계별 비디오 녹화 시스템"""
+    """按训练阶段录制视频的系统"""
 
     def __init__(self, base_dir: str, fps: int = 30):
         self.base_dir = base_dir
@@ -151,8 +151,8 @@ class StageVideoRecorder:
         os.makedirs(base_dir, exist_ok=True)
 
     def record_stage_episodes(self, stage_name: str, model, env, num_episodes: int = 3):
-        """특정 단계의 에피소드들 녹화"""
-        print(f"\n🎬 [{stage_name}] 비디오 녹화 시작 ({num_episodes}개 에피소드)")
+        """录制指定阶段的多个回合"""
+        print(f"\n🎬 [{stage_name}] 开始录制视频（{num_episodes}个回合）")
 
         stage_dir = os.path.join(self.base_dir, stage_name)
         os.makedirs(stage_dir, exist_ok=True)
@@ -201,15 +201,15 @@ class StageVideoRecorder:
         success_count = sum(1 for r in episode_results if r.get("success", False))
         avg_reward = np.mean([float(r["reward"]) for r in episode_results]) if episode_results else 0.0
 
-        print(f"✅ [{stage_name}] 완료!")
-        print(f"   녹화된 에피소드: {len(episode_results)}개")
-        print(f"   성공률: {success_count}/{len(episode_results)}")
-        print(f"   평균 보상: {avg_reward:.2f}")
+        print(f"✅ [{stage_name}] 完成！")
+        print(f"   已录制回合: {len(episode_results)}个")
+        print(f"   成功率: {success_count}/{len(episode_results)}")
+        print(f"   平均奖励: {avg_reward:.2f}")
 
         return episode_results
 
     def _record_single_episode(self, recorder, model, env, episode_idx, stage_name):
-        """단일 에피소드 녹화"""
+        """录制单个回合"""
         recorder.start_episode_recording()
 
         obs = env.reset()
@@ -270,12 +270,12 @@ class StageVideoRecorder:
         return None
 
     def create_highlight_reel(self):
-        """최고 보상 에피소드들로 하이라이트 비디오 생성"""
+        """根据最高奖励回合生成高光视频"""
         if not self.best_episodes:
-            print("❌ 하이라이트 생성 실패: 에피소드 없음")
+            print("❌ 生成高光失败：没有回合")
             return
 
-        print(f"\n📦 하이라이트 폴더 생성 중... (상위 {len(self.best_episodes)}개 에피소드)")
+        print(f"\n📦 正在创建高光文件夹...（前 {len(self.best_episodes)} 个回合）")
 
         highlight_dir = os.path.join(self.base_dir, "highlights")
         os.makedirs(highlight_dir, exist_ok=True)
@@ -301,10 +301,10 @@ class StageVideoRecorder:
         with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(highlight_metadata, f, indent=4, ensure_ascii=False)
 
-        print(f"✅ 하이라이트 완료! {highlight_dir}")
+        print(f"✅ 高光完成！{highlight_dir}")
 
     def save_evaluation_summary(self):
-        """전체 평가 요약 저장"""
+        """保存整体评估摘要"""
         summary = {
             "stages_evaluated": [str(x) for x in self.stage_results.keys()],
             "total_episodes": int(sum(len(episodes) for episodes in self.stage_results.values())),
@@ -329,5 +329,5 @@ class StageVideoRecorder:
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(_to_json_safe(summary), f, indent=4, ensure_ascii=False)
 
-        print(f"\n📊 평가 요약 저장: {summary_path}")
+        print(f"\n📊 评估摘要已保存: {summary_path}")
         return summary
