@@ -35,13 +35,21 @@ class FrankaEnv(MujocoRobotEnv):
         obj_xy_range: float = 0.3,
         goal_x_offset: float = 0.4,
         goal_z_range: float = 0.2,
+        orientation_action_size: int = 0,
+        position_action_scale: float = 0.05,
+        rotation_action_scale: float = 0.20,
         **kwargs,
     ):
         self.block_gripper = block_gripper
         self.terminate_on_success = bool(terminate_on_success)
         self.model_path = model_path
+        self.orientation_action_size = int(max(orientation_action_size, 0))
+        self.control_orientation = self.orientation_action_size > 0
+        self.position_action_scale = float(position_action_scale)
+        self.rotation_action_scale = float(rotation_action_scale)
 
         action_size = 3
+        action_size += self.orientation_action_size
         action_size += 0 if self.block_gripper else 1
 
         self.reward_type = reward_type
@@ -175,24 +183,31 @@ class FrankaEnv(MujocoRobotEnv):
         action = action.copy()
         # for the pick and place task
         if not self.block_gripper:
-            pos_ctrl, gripper_ctrl = action[:3], action[3]
+            pos_ctrl = action[:3]
+            rot_ctrl = action[3:6] if self.control_orientation else None
+            gripper_ctrl = action[3 + self.orientation_action_size]
             fingers_ctrl = gripper_ctrl * 0.2
             fingers_width = self.get_fingers_width().copy() + fingers_ctrl
             fingers_half_width = np.clip(fingers_width / 2, self.ctrl_range[-1, 0], self.ctrl_range[-1, 1])
 
         elif self.block_gripper:
             pos_ctrl = action
+            rot_ctrl = None
             fingers_half_width = 0
 
         # control the gripper
         self.data.ctrl[-2:] = fingers_half_width
 
         # control the end-effector with mocap body
-        pos_ctrl *= 0.05
+        pos_ctrl *= self.position_action_scale
         pos_ctrl += self.get_ee_position().copy()
         pos_ctrl[2] = np.max((0, pos_ctrl[2]))
 
-        self.set_mocap_pose(pos_ctrl, self.grasp_site_pose)
+        target_quat = self.grasp_site_pose.copy()
+        if self.control_orientation and rot_ctrl is not None:
+            target_quat = self._apply_rotation_action(self.get_mocap_quaternion(), rot_ctrl)
+
+        self.set_mocap_pose(pos_ctrl, target_quat)
 
     def _get_obs(self) -> dict:
         # robot
@@ -352,8 +367,19 @@ class FrankaEnv(MujocoRobotEnv):
         self._mujoco.mju_mat2Quat(current_quat, site_mat)
         return current_quat
 
+    def get_ee_rotation_matrix(self) -> np.ndarray:
+        return self._utils.get_site_xmat(self.model, self.data, "ee_center_site").reshape(3, 3).copy()
+
+    def get_ee_forward_axis(self) -> np.ndarray:
+        return self._normalize_vector(self.get_ee_rotation_matrix()[:, 2])
+
     def get_ee_position(self) -> np.ndarray:
         return self._utils.get_site_xpos(self.model, self.data, "ee_center_site")
+
+    def get_mocap_quaternion(self) -> np.ndarray:
+        if getattr(self.data, "mocap_quat", None) is None or self.data.mocap_quat.size == 0:
+            return self.grasp_site_pose.copy()
+        return np.asarray(self.data.mocap_quat[0], dtype=np.float64).copy()
 
     def get_body_state(self, name) -> np.ndarray:
         body_id = self._model_names.body_name2id[name]
@@ -366,3 +392,24 @@ class FrankaEnv(MujocoRobotEnv):
         finger1 = self._utils.get_joint_qpos(self.model, self.data, "finger_joint1")
         finger2 = self._utils.get_joint_qpos(self.model, self.data, "finger_joint2")
         return finger1 + finger2
+
+    def _normalize_vector(self, vector: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+        vector = np.asarray(vector, dtype=np.float64)
+        norm = float(np.linalg.norm(vector))
+        if norm < eps:
+            return np.zeros_like(vector)
+        return vector / norm
+
+    def _apply_rotation_action(self, current_quat: np.ndarray, rot_ctrl: np.ndarray) -> np.ndarray:
+        rotvec = np.asarray(rot_ctrl, dtype=np.float64) * self.rotation_action_scale
+        angle = float(np.linalg.norm(rotvec))
+        current_quat = self._normalize_vector(current_quat)
+        if angle < 1e-8:
+            return current_quat
+
+        axis = rotvec / angle
+        delta_quat = np.empty(4, dtype=np.float64)
+        composed_quat = np.empty(4, dtype=np.float64)
+        self._mujoco.mju_axisAngle2Quat(delta_quat, axis, angle)
+        self._mujoco.mju_mulQuat(composed_quat, delta_quat, current_quat)
+        return self._normalize_vector(composed_quat)

@@ -8,6 +8,16 @@
 import gymnasium as gym
 import numpy as np
 
+from train.common.pickplace_utils import (
+    goal_alignment,
+    goal_orientation_error,
+    goal_position,
+    is_window_goal,
+    pickplace_expert_action,
+    pickplace_next_phase,
+    pickplace_phase_names,
+)
+
 
 class RewardScalingWrapper(gym.Wrapper):
     """奖励缩放包装器"""
@@ -37,38 +47,30 @@ class RewardScalingWrapper(gym.Wrapper):
 class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
     """为 observation 添加 pick-and-place 任务进度的包装器。"""
 
-    phase_names = (
-        "approach",
-        "descend",
-        "grasp",
-        "lift",
-        "move",
-        "place",
-        "hold",
-    )
-
     def __init__(self, env, hint_style: str = "staged"):
         super().__init__(env)
-        self.phase_name = "approach"
-        self.phase_steps = 0
-        self.initial_object_height = 0.0
-        self.last_expert_hint_action = np.zeros(4, dtype=np.float32)
-        self.hint_style = str(hint_style)
-
         observation_space = self.observation_space
         if not isinstance(observation_space, gym.spaces.Dict):
             raise TypeError("PickAndPlaceTaskProgressWrapper expects a Dict observation space")
+        desired_goal_dim = int(np.prod(observation_space["achieved_goal"].shape))
+        self.action_dim = int(np.prod(self.action_space.shape))
+        self.phase_names = pickplace_phase_names(self.action_dim, desired_goal_dim)
+        self.phase_name = self.phase_names[0]
+        self.phase_steps = 0
+        self.initial_object_height = 0.0
+        self.last_expert_hint_action = np.zeros(self.action_dim, dtype=np.float32)
+        self.hint_style = str(hint_style)
 
         base_observation_space = observation_space["observation"]
-        extra_dim = 3 + 3 + 1 + 1 + 1 + len(self.phase_names) + 4
+        extra_dim = 3 + 3 + 1 + 1 + 1 + len(self.phase_names) + self.action_dim
         low = np.concatenate([
             np.asarray(base_observation_space.low, dtype=np.float32),
-            np.full(3 + 3 + 1 + 1 + 1 + 4, -np.inf, dtype=np.float32),
+            np.full(3 + 3 + 1 + 1 + 1 + self.action_dim, -np.inf, dtype=np.float32),
             np.zeros(len(self.phase_names), dtype=np.float32),
         ])
         high = np.concatenate([
             np.asarray(base_observation_space.high, dtype=np.float32),
-            np.full(3 + 3 + 1 + 1 + 1 + 4, np.inf, dtype=np.float32),
+            np.full(3 + 3 + 1 + 1 + 1 + self.action_dim, np.inf, dtype=np.float32),
             np.ones(len(self.phase_names), dtype=np.float32),
         ])
 
@@ -83,46 +85,24 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
         return phase
 
     def _expert_hint_action(self, observation) -> np.ndarray:
-        ee_position = np.asarray(observation["observation"][:3], dtype=np.float32)
-        object_position = np.asarray(observation["achieved_goal"], dtype=np.float32)
-        goal_position = np.asarray(observation["desired_goal"], dtype=np.float32)
-        if self.hint_style == "direct":
-            xy_distance = float(np.linalg.norm((goal_position - object_position)[:2]))
-            goal_height = max(float(goal_position[2] - self.initial_object_height), 0.0)
-            carry_height = float(np.clip(goal_height + 0.035 + 0.35 * xy_distance, 0.05, 0.11))
-            carry_z = float(max(goal_position[2] + 0.015, self.initial_object_height + carry_height))
-            targets = {
-                "approach": (object_position + np.array([0.0, 0.0, 0.075], dtype=np.float32), 1.0),
-                "descend": (object_position + np.array([0.0, 0.0, 0.008], dtype=np.float32), 1.0),
-                "grasp": (object_position + np.array([0.0, 0.0, 0.004], dtype=np.float32), -1.0),
-                "lift": (np.array([object_position[0], object_position[1], carry_z], dtype=np.float32), -1.0),
-                "move": (np.array([goal_position[0], goal_position[1], carry_z], dtype=np.float32), -1.0),
-                "place": (goal_position + np.array([0.0, 0.0, 0.015], dtype=np.float32), -1.0),
-                "hold": (goal_position + np.array([0.0, 0.0, 0.015], dtype=np.float32), -1.0),
-            }
-            target_position, gripper_action = targets[self.phase_name]
-            delta = np.clip((target_position - ee_position) / 0.05, -1.0, 1.0)
-            return np.concatenate([delta, np.array([gripper_action], dtype=np.float32)]).astype(np.float32)
-        safe_z = max(float(goal_position[2] + 0.10), float(object_position[2] + 0.10), 0.18)
-        targets = {
-            "approach": (object_position + np.array([0.0, 0.0, 0.10], dtype=np.float32), 1.0),
-            "descend": (object_position + np.array([0.0, 0.0, 0.01], dtype=np.float32), 1.0),
-            "grasp": (object_position + np.array([0.0, 0.0, 0.005], dtype=np.float32), -1.0),
-            "lift": (np.array([object_position[0], object_position[1], safe_z], dtype=np.float32), -1.0),
-            "move": (np.array([goal_position[0], goal_position[1], safe_z], dtype=np.float32), -1.0),
-            "place": (goal_position + np.array([0.0, 0.0, 0.02], dtype=np.float32), -1.0),
-            "hold": (goal_position + np.array([0.0, 0.0, 0.02], dtype=np.float32), -1.0),
-        }
-        target_position, gripper_action = targets[self.phase_name]
-        delta = np.clip((target_position - ee_position) / 0.05, -1.0, 1.0)
-        return np.concatenate([delta, np.array([gripper_action], dtype=np.float32)]).astype(np.float32)
+        ee_forward_axis = None
+        if hasattr(self.unwrapped, "get_ee_forward_axis"):
+            ee_forward_axis = self.unwrapped.get_ee_forward_axis()
+        return pickplace_expert_action(
+            observation,
+            self.phase_name,
+            self.initial_object_height,
+            action_dim=self.action_dim,
+            hint_style=self.hint_style,
+            ee_forward_axis=ee_forward_axis,
+        )
 
     def _augment_observation(self, observation):
         ee_position = np.asarray(observation["observation"][:3], dtype=np.float32)
-        object_position = np.asarray(observation["achieved_goal"], dtype=np.float32)
-        goal_position = np.asarray(observation["desired_goal"], dtype=np.float32)
+        object_position = goal_position(observation["achieved_goal"])
+        goal_pos = goal_position(observation["desired_goal"])
         ee_to_object = object_position - ee_position
-        object_to_goal = goal_position - object_position
+        object_to_goal = goal_pos - object_position
         ee_object_distance = np.array([np.linalg.norm(ee_to_object)], dtype=np.float32)
         object_goal_distance = np.array([np.linalg.norm(object_to_goal)], dtype=np.float32)
         lift_height = np.array([object_position[2] - self.initial_object_height], dtype=np.float32)
@@ -145,63 +125,22 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
         }
 
     def _update_phase(self, observation) -> None:
-        ee_position = np.asarray(observation["observation"][:3], dtype=np.float32)
-        object_position = np.asarray(observation["achieved_goal"], dtype=np.float32)
-        goal_position = np.asarray(observation["desired_goal"], dtype=np.float32)
-
-        horizontal_distance = float(np.linalg.norm((ee_position - object_position)[:2]))
-        ee_object_distance = float(np.linalg.norm(ee_position - object_position))
-        object_goal_distance = float(np.linalg.norm(object_position - goal_position))
-
-        if self.hint_style == "direct":
-            goal_height = max(float(goal_position[2] - self.initial_object_height), 0.0)
-            carry_height = float(np.clip(goal_height + 0.035 + 0.35 * object_goal_distance, 0.05, 0.11))
-            required_lift = max(0.025, 0.55 * carry_height)
-            if self.phase_name == "approach" and horizontal_distance < 0.015 and ee_position[2] > object_position[2] + 0.05:
-                self.phase_name = "descend"
-                self.phase_steps = 0
-            elif self.phase_name == "descend" and ee_object_distance < 0.02:
-                self.phase_name = "grasp"
-                self.phase_steps = 0
-            elif self.phase_name == "grasp" and self.phase_steps > 10:
-                self.phase_name = "lift"
-                self.phase_steps = 0
-            elif self.phase_name == "lift" and object_position[2] > self.initial_object_height + required_lift:
-                self.phase_name = "move"
-                self.phase_steps = 0
-            elif self.phase_name == "move" and float(np.linalg.norm((object_position - goal_position)[:2])) < 0.03:
-                self.phase_name = "place"
-                self.phase_steps = 0
-            elif self.phase_name == "place" and object_goal_distance < 0.04:
-                self.phase_name = "hold"
-                self.phase_steps = 0
-            self.phase_steps += 1
-            return
-
-        if self.phase_name == "approach" and horizontal_distance < 0.015 and ee_position[2] > object_position[2] + 0.06:
-            self.phase_name = "descend"
-            self.phase_steps = 0
-        elif self.phase_name == "descend" and ee_object_distance < 0.02:
-            self.phase_name = "grasp"
-            self.phase_steps = 0
-        elif self.phase_name == "grasp" and self.phase_steps > 12:
-            self.phase_name = "lift"
-            self.phase_steps = 0
-        elif self.phase_name == "lift" and object_position[2] > goal_position[2] + 0.03:
-            self.phase_name = "move"
-            self.phase_steps = 0
-        elif self.phase_name == "move" and float(np.linalg.norm((object_position - goal_position)[:2])) < 0.03:
-            self.phase_name = "place"
-            self.phase_steps = 0
-        elif self.phase_name == "place" and object_goal_distance < 0.04:
-            self.phase_name = "hold"
-            self.phase_steps = 0
-
-        self.phase_steps += 1
+        ee_forward_axis = None
+        if hasattr(self.unwrapped, "get_ee_forward_axis"):
+            ee_forward_axis = self.unwrapped.get_ee_forward_axis()
+        self.phase_name, self.phase_steps = pickplace_next_phase(
+            observation,
+            self.phase_name,
+            self.phase_steps,
+            self.initial_object_height,
+            hint_style=self.hint_style,
+            action_dim=self.action_dim,
+            ee_forward_axis=ee_forward_axis,
+        )
 
     def reset(self, **kwargs):
         observation, info = self.env.reset(**kwargs)
-        self.phase_name = "approach"
+        self.phase_name = self.phase_names[0]
         self.phase_steps = 0
         self.initial_object_height = float(np.asarray(observation["achieved_goal"], dtype=np.float32)[2])
         return self._augment_observation(observation), info
@@ -241,10 +180,10 @@ class PickAndPlaceGeometryWrapper(gym.ObservationWrapper):
 
     def _augment_observation(self, observation):
         ee_position = np.asarray(observation["observation"][:3], dtype=np.float32)
-        object_position = np.asarray(observation["achieved_goal"], dtype=np.float32)
-        goal_position = np.asarray(observation["desired_goal"], dtype=np.float32)
+        object_position = goal_position(observation["achieved_goal"])
+        goal_pos = goal_position(observation["desired_goal"])
         ee_to_object = object_position - ee_position
-        object_to_goal = goal_position - object_position
+        object_to_goal = goal_pos - object_position
         ee_object_distance = np.array([np.linalg.norm(ee_to_object)], dtype=np.float32)
         object_goal_distance = np.array([np.linalg.norm(object_to_goal)], dtype=np.float32)
         lift_height = np.array([object_position[2] - self.initial_object_height], dtype=np.float32)
@@ -275,26 +214,18 @@ class PickAndPlaceGeometryWrapper(gym.ObservationWrapper):
 class PickAndPlaceStageFeatureWrapper(gym.ObservationWrapper):
     """为 pick-and-place 添加 phase one-hot + 几何特征的包装器。"""
 
-    phase_names = (
-        "approach",
-        "descend",
-        "grasp",
-        "lift",
-        "move",
-        "place",
-        "hold",
-    )
-
     def __init__(self, env, hint_style: str = "staged"):
         super().__init__(env)
-        self.phase_name = "approach"
-        self.phase_steps = 0
-        self.initial_object_height = 0.0
-        self.hint_style = str(hint_style)
-
         observation_space = self.observation_space
         if not isinstance(observation_space, gym.spaces.Dict):
             raise TypeError("PickAndPlaceStageFeatureWrapper expects a Dict observation space")
+        desired_goal_dim = int(np.prod(observation_space["achieved_goal"].shape))
+        self.action_dim = int(np.prod(self.action_space.shape))
+        self.phase_names = pickplace_phase_names(self.action_dim, desired_goal_dim)
+        self.phase_name = self.phase_names[0]
+        self.phase_steps = 0
+        self.initial_object_height = 0.0
+        self.hint_style = str(hint_style)
 
         base_observation_space = observation_space["observation"]
         extra_dim = 3 + 3 + 1 + 1 + 1 + len(self.phase_names)
@@ -321,10 +252,10 @@ class PickAndPlaceStageFeatureWrapper(gym.ObservationWrapper):
 
     def _augment_observation(self, observation):
         ee_position = np.asarray(observation["observation"][:3], dtype=np.float32)
-        object_position = np.asarray(observation["achieved_goal"], dtype=np.float32)
-        goal_position = np.asarray(observation["desired_goal"], dtype=np.float32)
+        object_position = goal_position(observation["achieved_goal"])
+        goal_pos = goal_position(observation["desired_goal"])
         ee_to_object = object_position - ee_position
-        object_to_goal = goal_position - object_position
+        object_to_goal = goal_pos - object_position
         ee_object_distance = np.array([np.linalg.norm(ee_to_object)], dtype=np.float32)
         object_goal_distance = np.array([np.linalg.norm(object_to_goal)], dtype=np.float32)
         lift_height = np.array([object_position[2] - self.initial_object_height], dtype=np.float32)
@@ -344,63 +275,22 @@ class PickAndPlaceStageFeatureWrapper(gym.ObservationWrapper):
         }
 
     def _update_phase(self, observation) -> None:
-        ee_position = np.asarray(observation["observation"][:3], dtype=np.float32)
-        object_position = np.asarray(observation["achieved_goal"], dtype=np.float32)
-        goal_position = np.asarray(observation["desired_goal"], dtype=np.float32)
-
-        horizontal_distance = float(np.linalg.norm((ee_position - object_position)[:2]))
-        ee_object_distance = float(np.linalg.norm(ee_position - object_position))
-        object_goal_distance = float(np.linalg.norm(object_position - goal_position))
-
-        if self.hint_style == "direct":
-            goal_height = max(float(goal_position[2] - self.initial_object_height), 0.0)
-            carry_height = float(np.clip(goal_height + 0.035 + 0.35 * object_goal_distance, 0.05, 0.11))
-            required_lift = max(0.025, 0.55 * carry_height)
-            if self.phase_name == "approach" and horizontal_distance < 0.015 and ee_position[2] > object_position[2] + 0.05:
-                self.phase_name = "descend"
-                self.phase_steps = 0
-            elif self.phase_name == "descend" and ee_object_distance < 0.02:
-                self.phase_name = "grasp"
-                self.phase_steps = 0
-            elif self.phase_name == "grasp" and self.phase_steps > 10:
-                self.phase_name = "lift"
-                self.phase_steps = 0
-            elif self.phase_name == "lift" and object_position[2] > self.initial_object_height + required_lift:
-                self.phase_name = "move"
-                self.phase_steps = 0
-            elif self.phase_name == "move" and float(np.linalg.norm((object_position - goal_position)[:2])) < 0.03:
-                self.phase_name = "place"
-                self.phase_steps = 0
-            elif self.phase_name == "place" and object_goal_distance < 0.04:
-                self.phase_name = "hold"
-                self.phase_steps = 0
-            self.phase_steps += 1
-            return
-
-        if self.phase_name == "approach" and horizontal_distance < 0.015 and ee_position[2] > object_position[2] + 0.06:
-            self.phase_name = "descend"
-            self.phase_steps = 0
-        elif self.phase_name == "descend" and ee_object_distance < 0.02:
-            self.phase_name = "grasp"
-            self.phase_steps = 0
-        elif self.phase_name == "grasp" and self.phase_steps > 12:
-            self.phase_name = "lift"
-            self.phase_steps = 0
-        elif self.phase_name == "lift" and object_position[2] > goal_position[2] + 0.03:
-            self.phase_name = "move"
-            self.phase_steps = 0
-        elif self.phase_name == "move" and float(np.linalg.norm((object_position - goal_position)[:2])) < 0.03:
-            self.phase_name = "place"
-            self.phase_steps = 0
-        elif self.phase_name == "place" and object_goal_distance < 0.04:
-            self.phase_name = "hold"
-            self.phase_steps = 0
-
-        self.phase_steps += 1
+        ee_forward_axis = None
+        if hasattr(self.unwrapped, "get_ee_forward_axis"):
+            ee_forward_axis = self.unwrapped.get_ee_forward_axis()
+        self.phase_name, self.phase_steps = pickplace_next_phase(
+            observation,
+            self.phase_name,
+            self.phase_steps,
+            self.initial_object_height,
+            hint_style=self.hint_style,
+            action_dim=self.action_dim,
+            ee_forward_axis=ee_forward_axis,
+        )
 
     def reset(self, **kwargs):
         observation, info = self.env.reset(**kwargs)
-        self.phase_name = "approach"
+        self.phase_name = self.phase_names[0]
         self.phase_steps = 0
         self.initial_object_height = float(np.asarray(observation["achieved_goal"], dtype=np.float32)[2])
         return self._augment_observation(observation), info
@@ -471,7 +361,15 @@ class PickAndPlaceDenseRewardWrapper(gym.Wrapper):
         ee_object_distance: np.ndarray,
         object_height: np.ndarray,
     ) -> np.ndarray:
-        distances = np.linalg.norm(achieved_goal - desired_goal, axis=-1)
+        if is_window_goal(desired_goal):
+            return self._compute_window_reward(
+                achieved_goal,
+                desired_goal,
+                ee_object_distance,
+                object_height,
+                direct_style=False,
+            )
+        distances = np.linalg.norm(goal_position(achieved_goal) - goal_position(desired_goal), axis=-1)
         reward = -distances.astype(np.float32)
         reward -= 0.25 * ee_object_distance
 
@@ -492,7 +390,15 @@ class PickAndPlaceDenseRewardWrapper(gym.Wrapper):
         ee_object_distance: np.ndarray,
         object_height: np.ndarray,
     ) -> np.ndarray:
-        delta = desired_goal - achieved_goal
+        if is_window_goal(desired_goal):
+            return self._compute_window_reward(
+                achieved_goal,
+                desired_goal,
+                ee_object_distance,
+                object_height,
+                direct_style=True,
+            )
+        delta = goal_position(desired_goal) - goal_position(achieved_goal)
         xy_distance = np.linalg.norm(delta[..., :2], axis=-1).astype(np.float32)
         z_distance = np.abs(delta[..., 2]).astype(np.float32)
         full_distance = np.linalg.norm(delta, axis=-1).astype(np.float32)
@@ -524,10 +430,39 @@ class PickAndPlaceDenseRewardWrapper(gym.Wrapper):
         reward += 0.50 * (full_distance < distance_threshold).astype(np.float32)
         return reward.astype(np.float32)
 
+    def _compute_window_reward(
+        self,
+        achieved_goal: np.ndarray,
+        desired_goal: np.ndarray,
+        ee_object_distance: np.ndarray,
+        object_height: np.ndarray,
+        direct_style: bool,
+    ) -> np.ndarray:
+        achieved_pos = goal_position(achieved_goal)
+        desired_pos = goal_position(desired_goal)
+        distances = np.linalg.norm(achieved_pos - desired_pos, axis=-1).astype(np.float32)
+        orientation_alignment = np.asarray(goal_alignment(achieved_goal, desired_goal), dtype=np.float32)
+        orientation_error = np.asarray(goal_orientation_error(achieved_goal, desired_goal), dtype=np.float32)
+
+        base = self.unwrapped
+        distance_threshold = float(getattr(base, "distance_threshold", 0.03))
+        orientation_threshold = float(getattr(base, "orientation_threshold_cos", np.cos(np.deg2rad(20.0))))
+        clipped_object_height = np.maximum(object_height, 0.0).astype(np.float32)
+
+        reward = -distances
+        reward -= (0.20 if direct_style else 0.15) * ee_object_distance
+        reward -= (0.35 if direct_style else 0.25) * orientation_error
+        reward += 0.35 * np.minimum(clipped_object_height, 0.12)
+        reward += 0.25 * (orientation_alignment >= orientation_threshold).astype(np.float32)
+        reward += 0.50 * (
+            (distances < distance_threshold) & (orientation_alignment >= orientation_threshold)
+        ).astype(np.float32)
+        return reward.astype(np.float32)
+
     def compute_reward(self, achieved_goal, desired_goal, info):
         achieved_goal = np.asarray(achieved_goal, dtype=np.float32)
         desired_goal = np.asarray(desired_goal, dtype=np.float32)
-        distances = np.linalg.norm(achieved_goal - desired_goal, axis=-1)
+        distances = np.linalg.norm(goal_position(achieved_goal) - goal_position(desired_goal), axis=-1)
         ee_object_distance = self._info_array(info, "ee_object_distance", 0.0, distances.shape)
         object_height = self._info_array(info, "object_height", 0.0, distances.shape)
 

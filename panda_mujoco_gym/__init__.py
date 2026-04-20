@@ -7,9 +7,10 @@ MAX_EPISODE_STEPS_BY_TASK = {
     "Slide": 100,
     "Push": 100,
     "PickAndPlace": 200,
+    "PickAndPlaceWindow": 250,
 }
 
-for task in ["Slide", "Push", "PickAndPlace"]:
+for task in ["Slide", "Push", "PickAndPlace", "PickAndPlaceWindow"]:
     for reward_type in ["sparse", "dense"]:
         reward_suffix = "Dense" if reward_type == "dense" else "Sparse"
         env_id = f"Franka{task}{reward_suffix}-v0"

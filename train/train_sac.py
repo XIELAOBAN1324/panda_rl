@@ -360,14 +360,14 @@ def run_behavior_cloning_pretrain(model, dataset: ExpertDataset, config: SACConf
             )
             target_actions = torch.clamp(target_actions, -0.999, 0.999)
             predicted_actions = torch.tanh(mean_actions)
-            predicted_xyz = predicted_actions[:, :3]
-            predicted_gripper = predicted_actions[:, 3:]
-            target_xyz = target_actions[:, :3]
-            target_gripper = target_actions[:, 3:]
-            bc_xyz_mse = torch.nn.functional.mse_loss(predicted_xyz, target_xyz)
+            predicted_motion = predicted_actions[:, :-1]
+            predicted_gripper = predicted_actions[:, -1:]
+            target_motion = target_actions[:, :-1]
+            target_gripper = target_actions[:, -1:]
+            bc_motion_mse = torch.nn.functional.mse_loss(predicted_motion, target_motion)
             bc_gripper_mse = torch.nn.functional.mse_loss(predicted_gripper, target_gripper)
             bc_nll = -distribution.log_prob(target_actions).mean()
-            loss = bc_xyz_mse + 4.0 * bc_gripper_mse + 0.05 * bc_nll
+            loss = bc_motion_mse + 4.0 * bc_gripper_mse + 0.05 * bc_nll
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

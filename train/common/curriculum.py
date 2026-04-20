@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 import gymnasium as gym
 import numpy as np
 
+from train.common.pickplace_utils import goal_position, is_window_goal
+
 
 @dataclass(frozen=True)
 class CurriculumStage:
@@ -148,20 +150,37 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
         base.obj_range_low, base.obj_range_high = self._set_square_range(
             self.base_obj_center, stage.object_xy_range, self.base_obj_center[2], self.base_obj_center[2]
         )
+        goal_center = self.base_goal_center.copy()
+        goal_z_low = self.base_goal_center[2]
+        goal_z_high = self.base_goal_center[2] + stage.goal_max_z
+        if bool(getattr(base, "is_window_task", False)):
+            goal_center[2] = float(getattr(base, "window_goal_height", 0.2))
+            goal_z_low = goal_center[2]
+            goal_z_high = goal_center[2]
         base.goal_range_low, base.goal_range_high = self._set_square_range(
-            self.base_goal_center,
+            goal_center,
             max(stage.goal_radius_max * 2.0, 1e-3),
-            self.base_goal_center[2],
-            self.base_goal_center[2] + stage.goal_max_z,
+            goal_z_low,
+            goal_z_high,
         )
 
     def _sample_goal_near_object(self, object_pos: np.ndarray, stage: CurriculumStage) -> np.ndarray:
         base = self.unwrapped
-        goal = np.array(object_pos, dtype=np.float64).copy()
+        if bool(getattr(base, "is_window_task", False)):
+            goal = np.array(
+                [object_pos[0], object_pos[1], float(getattr(base, "window_goal_height", 0.2)), *base.window_normal],
+                dtype=np.float64,
+            )
+        else:
+            goal = np.array(object_pos, dtype=np.float64).copy()
 
         radius = float(self.np_random.uniform(stage.goal_radius_min, stage.goal_radius_max))
         theta = float(self.np_random.uniform(-np.pi, np.pi))
         goal[:2] += radius * np.array([np.cos(theta), np.sin(theta)])
+
+        if bool(getattr(base, "is_window_task", False)):
+            goal[:2] = np.clip(goal[:2], self.base_goal_range_low[:2], self.base_goal_range_high[:2])
+            return goal.astype(np.float32)
 
         if self.np_random.random() < stage.air_goal_prob:
             goal[2] = float(base.initial_object_height + self.np_random.uniform(stage.goal_min_z, stage.goal_max_z))
@@ -202,7 +221,7 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
         self._apply_stage_pre_reset(self.current_stage)
 
         obs, info = self.env.reset(**kwargs)
-        object_pos = np.array(obs["achieved_goal"], dtype=np.float64).copy()
+        object_pos = np.array(goal_position(obs["achieved_goal"]), dtype=np.float64).copy()
 
         if self.current_stage.spawn_ee_above_object:
             self._move_ee_above_object(object_pos, self.current_stage)
@@ -224,12 +243,12 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
             return 0.0
 
         ee_position = np.array(obs["observation"][:3], dtype=np.float64)
-        object_position = np.array(obs["achieved_goal"], dtype=np.float64)
-        goal_position = np.array(obs["desired_goal"], dtype=np.float64)
+        object_position = np.array(goal_position(obs["achieved_goal"]), dtype=np.float64)
+        goal_pos = np.array(goal_position(obs["desired_goal"]), dtype=np.float64)
         fingers_width = float(obs["observation"][6]) if obs["observation"].shape[0] > 6 else 0.0
 
         reach_dist = float(np.linalg.norm(ee_position - object_position))
-        goal_dist = float(np.linalg.norm(object_position - goal_position))
+        goal_dist = float(np.linalg.norm(object_position - goal_pos))
         lift_height = max(float(object_position[2] - self.unwrapped.initial_object_height), 0.0)
 
         reach_term = np.exp(-12.0 * reach_dist)
@@ -243,6 +262,9 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
             + 0.35 * lift_term
             + 0.15 * grasp_hint
         )
+        if is_window_goal(obs["desired_goal"]):
+            alignment = float(np.asarray(obs["achieved_goal"], dtype=np.float64)[3:6] @ np.asarray(obs["desired_goal"], dtype=np.float64)[3:6])
+            bonus += 0.20 * max(alignment, 0.0)
         return float(self.current_stage.shaping_scale * bonus)
 
     def step(self, action):
@@ -391,11 +413,18 @@ class SafePickAndPlaceCurriculumWrapper(gym.Wrapper):
         )
         # Keep goal range aligned with stage for env default sampling path.
         goal_xy = max(stage.goal_radius_max * 2.0, 1e-3)
+        goal_center = self.base_goal_center.copy()
+        goal_z_low = self.base_goal_center[2]
+        goal_z_high = self.base_goal_center[2] + stage.goal_max_z
+        if bool(getattr(base, "is_window_task", False)):
+            goal_center[2] = float(getattr(base, "window_goal_height", 0.2))
+            goal_z_low = goal_center[2]
+            goal_z_high = goal_center[2]
         base.goal_range_low, base.goal_range_high = self._set_square_range(
-            self.base_goal_center,
+            goal_center,
             goal_xy,
-            self.base_goal_center[2],
-            self.base_goal_center[2] + stage.goal_max_z,
+            goal_z_low,
+            goal_z_high,
         )
 
     def _sample_goal_near_object(self, object_pos: np.ndarray, stage: SafeCurriculumStage) -> np.ndarray:
@@ -411,13 +440,21 @@ class SafePickAndPlaceCurriculumWrapper(gym.Wrapper):
         best_distance = float("-inf")
 
         for _ in range(64):
-            goal = np.array(object_pos, dtype=np.float64).copy()
+            if bool(getattr(base, "is_window_task", False)):
+                goal = np.array(
+                    [object_pos[0], object_pos[1], float(getattr(base, "window_goal_height", 0.2)), *base.window_normal],
+                    dtype=np.float64,
+                )
+            else:
+                goal = np.array(object_pos, dtype=np.float64).copy()
 
             radius = float(self.np_random.uniform(stage.goal_radius_min, stage.goal_radius_max))
             theta = float(self.np_random.uniform(-np.pi, np.pi))
             goal[:2] += radius * np.array([np.cos(theta), np.sin(theta)])
 
-            if self.np_random.random() < stage.air_goal_prob:
+            if bool(getattr(base, "is_window_task", False)):
+                goal[:2] = np.clip(goal[:2], self.base_goal_range_low[:2], self.base_goal_range_high[:2])
+            elif self.np_random.random() < stage.air_goal_prob:
                 goal[2] = float(
                     base.initial_object_height
                     + self.np_random.uniform(stage.goal_min_z, stage.goal_max_z)
@@ -425,8 +462,9 @@ class SafePickAndPlaceCurriculumWrapper(gym.Wrapper):
             else:
                 goal[2] = float(base.initial_object_height)
 
-            goal = np.clip(goal, self.base_goal_range_low, self.base_goal_range_high)
-            distance = float(np.linalg.norm(goal - object_pos))
+            if not bool(getattr(base, "is_window_task", False)):
+                goal = np.clip(goal, self.base_goal_range_low, self.base_goal_range_high)
+            distance = float(np.linalg.norm(goal[:3] - object_pos[:3]))
             if distance > best_distance:
                 best_goal = goal.copy()
                 best_distance = distance
@@ -462,12 +500,12 @@ class SafePickAndPlaceCurriculumWrapper(gym.Wrapper):
 
         obs, info = self.env.reset(**kwargs)
         info = dict(info)
-        object_pos = np.array(obs["achieved_goal"], dtype=np.float64).copy()
+        object_pos = np.array(goal_position(obs["achieved_goal"]), dtype=np.float64).copy()
 
         if self.current_stage.spawn_ee_above_object:
             self._move_ee_above_object(object_pos, self.current_stage)
             obs = self.unwrapped._get_obs().copy()
-            object_pos = np.array(obs["achieved_goal"], dtype=np.float64).copy()
+            object_pos = np.array(goal_position(obs["achieved_goal"]), dtype=np.float64).copy()
 
         if not self.current_stage.use_env_default_goal:
             new_goal = self._sample_goal_near_object(object_pos, self.current_stage)
