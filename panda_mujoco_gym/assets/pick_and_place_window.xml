@@ -19,26 +19,37 @@
       <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
       <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
       <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
-      <material name="window_frame_mat" rgba="0.85 0.25 0.25 1"/>
+      <material name="window_frame_mat" rgba="0.63 0.67 0.72 1" specular="0.95" shininess="0.65" reflectance="0.35"/>
+      <material name="glass_mat" rgba="0.68 0.86 0.95 0.28" specular="0.98" shininess="0.85" reflectance="0.08"/>
+      <material name="pickup_station_mat" rgba="0.24 0.28 0.32 1" specular="0.45" shininess="0.40" reflectance="0.15"/>
+      <material name="pickup_pad_mat" rgba="0.12 0.16 0.20 1" specular="0.10" shininess="0.10" reflectance="0.02"/>
     </asset>
 
     <worldbody>
       <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
-      <camera name="watching" pos="1.669 -1.154 1.019" xyaxes="0.644 0.765 0.000 -0.250 0.210 0.945"/>
+      <camera name="watching" pos="-1.906515 -1.175593 1.141641" xyaxes="0.515038 -0.857167 0.000000 0.264879 0.159156 0.951057"/>
 
       <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
       <body name="window_frame" pos="0.6 0.0 0.5">
-        <geom name="window_frame_top" type="box" size="0.0125 0.20 0.0125" pos="0 0 0.1875" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
-        <geom name="window_frame_bottom" type="box" size="0.0125 0.20 0.0125" pos="0 0 -0.1875" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
-        <geom name="window_frame_left" type="box" size="0.0125 0.0125 0.175" pos="0 -0.1875 0" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
-        <geom name="window_frame_right" type="box" size="0.0125 0.0125 0.175" pos="0 0.1875 0" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
+        <geom name="window_frame_top" type="box" size="0.02 0.42 0.075" pos="0 0 0.255" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
+        <geom name="window_frame_bottom" type="box" size="0.02 0.42 0.075" pos="0 0 -0.255" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
+        <geom name="window_frame_left" type="box" size="0.02 0.075 0.18" pos="0 -0.345 0" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
+        <geom name="window_frame_right" type="box" size="0.02 0.075 0.18" pos="0 0.345 0" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
         <site name="target" pos="0 0 0" size="0.02" rgba="1 0 0 0.8" type="sphere"/>
       </body>
 
-      <body name="obj" pos="0.42 0.0 0.12" quat="1 0 0 0">
+      <body name="pickup_station" pos="0.0 -0.60 0.0">
+        <geom name="pickup_station_block" type="box" size="0.245 0.315 0.124" pos="0 0 0.124" material="pickup_station_mat" condim="6" friction="1.4 0.4 0.2"/>
+        <geom name="pickup_station_guard_front" type="box" size="0.245 0.006 0.025" pos="0 0.309 0.273" material="pickup_pad_mat" condim="6" friction="1.0 0.3 0.1"/>
+        <geom name="pickup_station_guard_back" type="box" size="0.245 0.006 0.025" pos="0 -0.309 0.273" material="pickup_pad_mat" condim="6" friction="1.0 0.3 0.1"/>
+        <geom name="pickup_station_guard_left" type="box" size="0.006 0.303 0.025" pos="-0.239 0 0.273" material="pickup_pad_mat" condim="6" friction="1.0 0.3 0.1"/>
+        <geom name="pickup_station_guard_right" type="box" size="0.006 0.303 0.025" pos="0.239 0 0.273" material="pickup_pad_mat" condim="6" friction="1.0 0.3 0.1"/>
+      </body>
+
+      <body name="obj" pos="0.0 -0.60 0.25" quat="1 0 0 0">
         <joint type="free" damping="0.01" name="obj_joint"/>
-        <geom name="obj_geom" mass="0.1" type="box" size="0.02 0.02 0.02" rgba="0.5 0.7 0.5 1" friction="1" condim="6"/>
+        <geom name="obj_geom" mass="0.18" type="box" size="0.175 0.265 0.002" material="glass_mat" friction="0.8 0.05 0.01" condim="6"/>
         <site name="obj_site" pos="0 0 0" size="0.01" type="sphere"/>
       </body>
     </worldbody>

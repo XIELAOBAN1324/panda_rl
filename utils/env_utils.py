@@ -34,6 +34,7 @@ def create_env(
     render_mode=None,
     reward_scale=1.0,
     seed: Optional[int] = None,
+    target_visible_in_rgb_array: bool = True,
     dense_reward_shaping: bool = False,
     dense_reward_style: str = "standard",
     task_geometry_features: bool = False,
@@ -44,7 +45,16 @@ def create_env(
     residual_action_scale: float = 0.1,
 ):
     """创建环境（应用包装器）"""
-    env = gym.make(env_name, render_mode=render_mode)
+    env = gym.make(
+        env_name,
+        render_mode=render_mode,
+        target_visible_in_rgb_array=target_visible_in_rgb_array,
+    )
+
+    if residual_guidance and is_pick_and_place_sparse(env_name):
+        task_progress_features = True
+        task_stage_features = False
+        task_geometry_features = False
 
     if task_progress_features and is_pick_and_place_sparse(env_name):
         env = PickAndPlaceTaskProgressWrapper(env, hint_style=expert_hint_style)
@@ -81,6 +91,7 @@ def create_vec_env(
     training=True,
     render_mode=None,
     seed: Optional[int] = None,
+    target_visible_in_rgb_array: bool = True,
     start_method: str = "forkserver",
     dense_reward_shaping: bool = False,
     dense_reward_style: str = "standard",
@@ -101,6 +112,7 @@ def create_vec_env(
                 render_mode=render_mode,
                 reward_scale=reward_scale,
                 seed=env_seed,
+                target_visible_in_rgb_array=target_visible_in_rgb_array,
                 dense_reward_shaping=dense_reward_shaping,
                 dense_reward_style=dense_reward_style,
                 task_geometry_features=task_geometry_features,

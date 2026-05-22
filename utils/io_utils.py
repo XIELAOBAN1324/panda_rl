@@ -4,6 +4,7 @@
 
 import os
 import json
+import re
 from typing import Dict, Any, Optional
 from stable_baselines3 import SAC, PPO, TD3
 from stable_baselines3.common.vec_env import VecNormalize
@@ -14,6 +15,10 @@ ALGORITHM_CLASSES = {
     'PPO': PPO,
     'TD3': TD3,
 }
+
+CHECKPOINT_NAME_PATTERN = re.compile(
+    r"^(?P<algorithm>[A-Za-z0-9]+)_(?P<env_name>.+)_(?P<steps>\d+)_steps\.zip$"
+)
 
 
 def load_model(model_path: str, algorithm: str = 'SAC', env=None):
@@ -50,6 +55,18 @@ def load_json(filepath: str) -> Dict[str, Any]:
 
     with open(filepath, 'r') as f:
         return json.load(f)
+
+
+def _infer_run_identity_from_checkpoint_name(filename: str) -> Dict[str, str]:
+    """从 checkpoint 文件名里恢复算法名与环境名。"""
+    match = CHECKPOINT_NAME_PATTERN.match(filename)
+    if not match:
+        return {}
+
+    return {
+        'algorithm': match.group('algorithm').upper(),
+        'env_name': match.group('env_name'),
+    }
 
 
 def get_experiment_info(exp_dir: str) -> Dict[str, Any]:
@@ -92,6 +109,17 @@ def get_experiment_info(exp_dir: str) -> Dict[str, Any]:
             checkpoints = [f for f in os.listdir(checkpoints_dir) if f.endswith('.zip')]
             info['checkpoints'] = sorted(checkpoints)
             info['checkpoints_dir'] = checkpoints_dir
+            for checkpoint_name in info['checkpoints']:
+                inferred = _infer_run_identity_from_checkpoint_name(checkpoint_name)
+                if not inferred:
+                    continue
+                if 'algorithm' not in info:
+                    info['algorithm'] = inferred['algorithm']
+                    info['algorithm_source'] = 'checkpoint_name'
+                if 'env_name' not in info:
+                    info['env_name'] = inferred['env_name']
+                    info['env_name_source'] = 'checkpoint_name'
+                break
             break
 
     return info

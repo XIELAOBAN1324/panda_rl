@@ -1,5 +1,5 @@
 #实验复现
-/home/lsy/.conda/envs/panda_rl/bin/python train/train_sac.py --env FrankaPickAndPlaceSparse-v0 --timesteps 20000 --exp-name gpu_directhint_residual_fixcheck_20k --pickplace-profile strong --dense-reward-style direct --expert-hint-style direct --expert-demo-style direct --residual-action-scale 0.05 --bc-epochs 4 --n-envs 4 --seed 0 --eval-freq 5000 --checkpoint-freq 20000 --device cuda:2
+/home/lsy/.conda/envs/panda_rl/bin/python train/train_sac.py --env FrankaPickAndPlaceWindowSparse-v0 --timesteps 20000 --exp-name gpu_directhint_residual_fixcheck_20k --pickplace-profile strong --dense-reward-style direct --expert-hint-style direct --expert-demo-style direct --residual-action-scale 0.05 --bc-epochs 4 --n-envs 4 --seed 0 --eval-freq 5000 --checkpoint-freq 20000 --device cuda:2
 
 
 #panda_mujoco_gym 的目录结构
@@ -43,7 +43,7 @@
 -------------------------------------------------------------------------------------------
 train_sac.py执行后 outputs 文件夹结构
 outputs/
-└── FrankaSlideDense-v0_SAC_20241219_143022/  # 实验文件夹
+└── FrankaPickAndPlaceWindowDense-v0_SAC_20241219_143022/  # 实验文件夹
     ├── models/
     │   ├── final_model.zip          # 最终模型
     │   ├── best_model.zip           # 最高性能模型  

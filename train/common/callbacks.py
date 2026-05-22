@@ -28,8 +28,22 @@ class TrainingCallback(BaseCallback):
         self.recent_rewards = deque(maxlen=100)
         self.recent_successes = deque(maxlen=100)
         self.recent_any_successes = deque(maxlen=100)
+        self.recent_collisions = deque(maxlen=100)
+        self.recent_plane_violations = deque(maxlen=100)
+        self.recent_position_errors = deque(maxlen=100)
+        self.recent_orientation_alignments = deque(maxlen=100)
+        self.recent_inplane_alignments = deque(maxlen=100)
+        self.recent_pose_alignments = deque(maxlen=100)
+        self.recent_glass_fits = deque(maxlen=100)
         self.recent_success_rate = 0.0
         self.recent_any_success_rate = 0.0
+        self.recent_collision_rate = 0.0
+        self.recent_plane_violation_rate = 0.0
+        self.recent_position_error = 0.0
+        self.recent_orientation_alignment = 0.0
+        self.recent_inplane_alignment = 0.0
+        self.recent_pose_alignment = 0.0
+        self.recent_glass_fits_rate = 0.0
 
         self.saved_stages = set()
         self.stage_timesteps = config.get_stage_timesteps()
@@ -43,6 +57,11 @@ class TrainingCallback(BaseCallback):
             writer.writerow([
                 "Timestep", "Episode", "Reward", "Length",
                 "Success", "Any_Success", "Success_Rate", "Any_Success_Rate",
+                "Collision", "Plane_Violation", "Position_Error",
+                "Orientation_Alignment", "Inplane_Alignment", "Pose_Alignment", "Glass_Fits_Window",
+                "Collision_Rate", "Plane_Violation_Rate", "Recent_Position_Error",
+                "Recent_Orientation_Alignment", "Recent_Inplane_Alignment", "Recent_Pose_Alignment",
+                "Glass_Fits_Rate",
                 "Best_Reward", "Stage", "Curriculum_Stage", "Curriculum_Progress", "Env_Index"
             ])
 
@@ -119,12 +138,30 @@ class TrainingCallback(BaseCallback):
         episode_length = info["episode"]["l"]
         is_success = bool(info.get("is_success", False))
         episode_any_success = bool(info.get("episode_any_success", is_success))
+        collision = bool(info.get("collision", False))
+        plane_violation = bool(info.get("plane_violation", False))
+        position_error = float(info.get("position_error", np.nan))
+        orientation_alignment = float(info.get("orientation_alignment", np.nan))
+        inplane_alignment = float(info.get("inplane_alignment", np.nan))
+        pose_alignment = float(info.get("pose_alignment", np.nan))
+        glass_fits_window = bool(info.get("glass_fits_window", False))
 
         self.episode_rewards.append(episode_reward)
         self.episode_lengths.append(episode_length)
         self.recent_rewards.append(episode_reward)
         self.recent_successes.append(int(is_success))
         self.recent_any_successes.append(int(episode_any_success))
+        self.recent_collisions.append(int(collision))
+        self.recent_plane_violations.append(int(plane_violation))
+        if np.isfinite(position_error):
+            self.recent_position_errors.append(position_error)
+        if np.isfinite(orientation_alignment):
+            self.recent_orientation_alignments.append(orientation_alignment)
+        if np.isfinite(inplane_alignment):
+            self.recent_inplane_alignments.append(inplane_alignment)
+        if np.isfinite(pose_alignment):
+            self.recent_pose_alignments.append(pose_alignment)
+        self.recent_glass_fits.append(int(glass_fits_window))
         self.episode_count += 1
 
         if is_success:
@@ -135,6 +172,27 @@ class TrainingCallback(BaseCallback):
         self.recent_success_rate = float(np.mean(self.recent_successes)) if self.recent_successes else 0.0
         self.recent_any_success_rate = (
             float(np.mean(self.recent_any_successes)) if self.recent_any_successes else 0.0
+        )
+        self.recent_collision_rate = (
+            float(np.mean(self.recent_collisions)) if self.recent_collisions else 0.0
+        )
+        self.recent_plane_violation_rate = (
+            float(np.mean(self.recent_plane_violations)) if self.recent_plane_violations else 0.0
+        )
+        self.recent_position_error = (
+            float(np.mean(self.recent_position_errors)) if self.recent_position_errors else 0.0
+        )
+        self.recent_orientation_alignment = (
+            float(np.mean(self.recent_orientation_alignments)) if self.recent_orientation_alignments else 0.0
+        )
+        self.recent_inplane_alignment = (
+            float(np.mean(self.recent_inplane_alignments)) if self.recent_inplane_alignments else 0.0
+        )
+        self.recent_pose_alignment = (
+            float(np.mean(self.recent_pose_alignments)) if self.recent_pose_alignments else 0.0
+        )
+        self.recent_glass_fits_rate = (
+            float(np.mean(self.recent_glass_fits)) if self.recent_glass_fits else 0.0
         )
 
         if episode_reward > self.best_reward:
@@ -149,6 +207,13 @@ class TrainingCallback(BaseCallback):
             self._print_progress()
 
         self.logger.record("rollout/any_success_rate", self.recent_any_success_rate)
+        self.logger.record("rollout/collision_rate", self.recent_collision_rate)
+        self.logger.record("rollout/plane_violation_rate", self.recent_plane_violation_rate)
+        self.logger.record("rollout/position_error", self.recent_position_error)
+        self.logger.record("rollout/orientation_alignment", self.recent_orientation_alignment)
+        self.logger.record("rollout/inplane_alignment", self.recent_inplane_alignment)
+        self.logger.record("rollout/pose_alignment", self.recent_pose_alignment)
+        self.logger.record("rollout/glass_fits_rate", self.recent_glass_fits_rate)
         self._save_to_csv(
             episode_reward,
             episode_length,
@@ -187,7 +252,14 @@ class TrainingCallback(BaseCallback):
             f"Avg: {avg_reward:8.2f} | "
             f"Len: {avg_length:6.1f} | "
             f"Success: {self.recent_success_rate:.3f} | "
-            f"AnySuccess: {self.recent_any_success_rate:.3f}"
+            f"AnySuccess: {self.recent_any_success_rate:.3f} | "
+            f"Collision: {self.recent_collision_rate:.3f} | "
+            f"Plane: {self.recent_plane_violation_rate:.3f} | "
+            f"PosErr: {self.recent_position_error:.4f} | "
+            f"Align: {self.recent_orientation_alignment:.3f} | "
+            f"InPlane: {self.recent_inplane_alignment:.3f} | "
+            f"PoseAlign: {self.recent_pose_alignment:.3f} | "
+            f"Fits: {self.recent_glass_fits_rate:.3f}"
         )
 
     def _save_to_csv(self, episode_reward, episode_length, is_success, any_success, current_stage, info, env_idx):
@@ -202,6 +274,20 @@ class TrainingCallback(BaseCallback):
             any_success,
             self.recent_success_rate,
             self.recent_any_success_rate,
+            bool(info.get("collision", False)),
+            bool(info.get("plane_violation", False)),
+            float(info.get("position_error", np.nan)),
+            float(info.get("orientation_alignment", np.nan)),
+            float(info.get("inplane_alignment", np.nan)),
+            float(info.get("pose_alignment", np.nan)),
+            bool(info.get("glass_fits_window", False)),
+            self.recent_collision_rate,
+            self.recent_plane_violation_rate,
+            self.recent_position_error,
+            self.recent_orientation_alignment,
+            self.recent_inplane_alignment,
+            self.recent_pose_alignment,
+            self.recent_glass_fits_rate,
             self.best_reward,
             current_stage,
             curriculum_stage,

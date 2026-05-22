@@ -7,10 +7,10 @@ from gymnasium_robotics.utils import rotations
 from typing import Optional, Any, SupportsFloat
 
 DEFAULT_CAMERA_CONFIG = {
-    "distance": 2.5,
-    "azimuth": 135.0,
-    "elevation": -20.0,
-    "lookat": np.array([0.0, 0.5, 0.0]),
+    "distance": 2.4,
+    "azimuth": -1.0,
+    "elevation": -18.0,
+    "lookat": np.array([0.0, 0.5, 0.05]),
 }
 
 
@@ -29,6 +29,8 @@ class FrankaEnv(MujocoRobotEnv):
         n_substeps: int = 50,
         reward_type: str = "sparse",
         block_gripper: bool = False,
+        include_gripper_action: bool = True,
+        fixed_gripper_action: float = 0.0,
         terminate_on_success: bool = False,
         distance_threshold: float = 0.05,
         goal_xy_range: float = 0.3,
@@ -41,6 +43,8 @@ class FrankaEnv(MujocoRobotEnv):
         **kwargs,
     ):
         self.block_gripper = block_gripper
+        self.include_gripper_action = bool(include_gripper_action) and not self.block_gripper
+        self.fixed_gripper_action = float(fixed_gripper_action)
         self.terminate_on_success = bool(terminate_on_success)
         self.model_path = model_path
         self.orientation_action_size = int(max(orientation_action_size, 0))
@@ -50,11 +54,12 @@ class FrankaEnv(MujocoRobotEnv):
 
         action_size = 3
         action_size += self.orientation_action_size
-        action_size += 0 if self.block_gripper else 1
+        action_size += 1 if self.include_gripper_action else 0
 
         self.reward_type = reward_type
+        self.has_gripper_joints = False
 
-        self.neutral_joint_values = np.array([0.00, 0.41, 0.00, -1.85, 0.00, 2.26, 0.79, 0.00, 0.00])
+        self.neutral_joint_values = np.array([0.00, 0.41, 0.00, -1.85, 0.00, 2.26, 0.79], dtype=np.float64)
 
         super().__init__(
             n_actions=action_size,
@@ -108,6 +113,7 @@ class FrankaEnv(MujocoRobotEnv):
         free_joint_index = self._model_names.joint_names.index("obj_joint")
         self.arm_joint_names = self._model_names.joint_names[:free_joint_index][0:7]
         self.gripper_joint_names = self._model_names.joint_names[:free_joint_index][7:9]
+        self.has_gripper_joints = len(self.gripper_joint_names) >= 2
 
         self._env_setup(self.neutral_joint_values)
         self.initial_time = self.data.time
@@ -115,6 +121,7 @@ class FrankaEnv(MujocoRobotEnv):
 
     def _env_setup(self, neutral_joint_values) -> None:
         self.set_joint_neutral()
+        self.data.ctrl[:] = 0.0
         self.data.ctrl[0:7] = neutral_joint_values[0:7]
         self.reset_mocap_welds(self.model, self.data)
 
@@ -181,22 +188,22 @@ class FrankaEnv(MujocoRobotEnv):
 
     def _set_action(self, action) -> None:
         action = action.copy()
-        # for the pick and place task
-        if not self.block_gripper:
-            pos_ctrl = action[:3]
-            rot_ctrl = action[3:6] if self.control_orientation else None
-            gripper_ctrl = action[3 + self.orientation_action_size]
-            fingers_ctrl = gripper_ctrl * 0.2
-            fingers_width = self.get_fingers_width().copy() + fingers_ctrl
-            fingers_half_width = np.clip(fingers_width / 2, self.ctrl_range[-1, 0], self.ctrl_range[-1, 1])
+        pos_ctrl = action[:3]
+        rot_ctrl = None
+        if self.control_orientation:
+            rot_start = 3
+            rot_end = rot_start + self.orientation_action_size
+            rot_ctrl = action[rot_start:rot_end]
+        if self.include_gripper_action:
+            suction_ctrl = float(action[3 + self.orientation_action_size])
+        else:
+            suction_ctrl = self.fixed_gripper_action
 
-        elif self.block_gripper:
-            pos_ctrl = action
-            rot_ctrl = None
-            fingers_half_width = 0
-
-        # control the gripper
-        self.data.ctrl[-2:] = fingers_half_width
+        if self.has_gripper_joints:
+            open_fraction = np.clip((suction_ctrl + 1.0) * 0.5, 0.0, 1.0)
+            target_width = open_fraction * 0.08
+            half_width = np.clip(target_width / 2, self.ctrl_range[-1, 0], self.ctrl_range[-1, 1])
+            self.data.ctrl[-2:] = half_width
 
         # control the end-effector with mocap body
         pos_ctrl *= self.position_action_scale
@@ -216,7 +223,7 @@ class FrankaEnv(MujocoRobotEnv):
         ee_velocity = self._utils.get_site_xvelp(self.model, self.data, "ee_center_site").copy() * self.dt
 
         if not self.block_gripper:
-            fingers_width = self.get_fingers_width().copy()
+            suction_state = np.array([self.get_gripper_state()], dtype=np.float64)
 
         # object
         # object cartesian position: 3
@@ -237,7 +244,7 @@ class FrankaEnv(MujocoRobotEnv):
                     [
                         ee_position,
                         ee_velocity,
-                        fingers_width,
+                        suction_state,
                         object_position,
                         object_rotation,
                         object_velp,
@@ -321,12 +328,12 @@ class FrankaEnv(MujocoRobotEnv):
 
     def set_joint_neutral(self) -> None:
         # assign value to arm joints
-        for name, value in zip(self.arm_joint_names, self.neutral_joint_values[0:7]):
+        for name, value in zip(self.arm_joint_names, self.neutral_joint_values):
             self._utils.set_joint_qpos(self.model, self.data, name, value)
 
-        # assign value to finger joints
-        for name, value in zip(self.gripper_joint_names, self.neutral_joint_values[7:9]):
-            self._utils.set_joint_qpos(self.model, self.data, name, value)
+        if self.has_gripper_joints:
+            for name in self.gripper_joint_names:
+                self._utils.set_joint_qpos(self.model, self.data, name, 0.04)
 
     def _sample_goal(self) -> np.ndarray:
         object_position = self.get_object_position()
@@ -371,7 +378,12 @@ class FrankaEnv(MujocoRobotEnv):
         return self._utils.get_site_xmat(self.model, self.data, "ee_center_site").reshape(3, 3).copy()
 
     def get_ee_forward_axis(self) -> np.ndarray:
-        return self._normalize_vector(self.get_ee_rotation_matrix()[:, 2])
+        # The suction tool's approach normal points opposite to the local +Z
+        # axis of ee_center_site in the current XML setup.
+        return self._normalize_vector(-self.get_ee_rotation_matrix()[:, 2])
+
+    def get_object_rotation_matrix(self) -> np.ndarray:
+        return self._utils.get_site_xmat(self.model, self.data, "obj_site").reshape(3, 3).copy()
 
     def get_ee_position(self) -> np.ndarray:
         return self._utils.get_site_xpos(self.model, self.data, "ee_center_site")
@@ -388,9 +400,11 @@ class FrankaEnv(MujocoRobotEnv):
         body_state = np.concatenate([body_xpos, body_xquat])
         return body_state
 
-    def get_fingers_width(self) -> np.ndarray:
-        finger1 = self._utils.get_joint_qpos(self.model, self.data, "finger_joint1")
-        finger2 = self._utils.get_joint_qpos(self.model, self.data, "finger_joint2")
+    def get_gripper_state(self) -> float:
+        if not self.has_gripper_joints:
+            return 1.0
+        finger1 = float(self._utils.get_joint_qpos(self.model, self.data, self.gripper_joint_names[0]))
+        finger2 = float(self._utils.get_joint_qpos(self.model, self.data, self.gripper_joint_names[1]))
         return finger1 + finger2
 
     def _normalize_vector(self, vector: np.ndarray, eps: float = 1e-8) -> np.ndarray:

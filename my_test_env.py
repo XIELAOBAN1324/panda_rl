@@ -13,7 +13,7 @@ def test_environment():
     try:
         # 首先以 headless 模式测试
         print("Testing environment in headless mode...")
-        env = gym.make("FrankaPickAndPlaceSparse-v0", render_mode="rgb_array")
+        env = gym.make("FrankaPickAndPlaceWindowSparse-v0", render_mode="rgb_array")
         
         observation, info = env.reset()
         print(f"Environment created successfully!")
@@ -48,7 +48,7 @@ def test_environment():
         
         # 测试图形模式
         print("\nTesting environment with graphics...")
-        env = gym.make("FrankaPickAndPlaceSparse-v0", render_mode="human")
+        env = gym.make("FrankaPickAndPlaceWindowSparse-v0", render_mode="human")
         
         observation, info = env.reset()
         
@@ -82,7 +82,7 @@ def test_environment():
             os.system('Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &')
             time.sleep(2)  # 等待显示启动
             
-            env = gym.make("FrankaPickAndPlaceSparse-v0", render_mode="rgb_array")
+            env = gym.make("FrankaPickAndPlaceWindowSparse-v0", render_mode="rgb_array")
             observation, info = env.reset()
             
             for step in range(50):

@@ -19,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description="Launch multiple panda_mujoco_gym training jobs across GPUs")
     parser.add_argument("--gpus", type=str, default="0,1,2,3", help="Comma-separated GPU ids")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3], help="Seeds to run")
-    parser.add_argument("--env", type=str, default="FrankaSlideDense-v0")
+    parser.add_argument("--env", type=str, default="FrankaPickAndPlaceWindowDense-v0")
     parser.add_argument("--timesteps", type=int, default=1_000_000)
     parser.add_argument("--n-envs", type=int, default=None)
     parser.add_argument("--extra-args", type=str, default="", help="Extra args passed to train/train_sac.py")

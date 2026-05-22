@@ -13,9 +13,11 @@ from train.common.pickplace_utils import (
     goal_orientation_error,
     goal_position,
     is_window_goal,
+    is_insertion_task,
     pickplace_expert_action,
     pickplace_next_phase,
     pickplace_phase_names,
+    WINDOW_INSERT_PHASE_NAMES,
 )
 
 
@@ -54,7 +56,9 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
             raise TypeError("PickAndPlaceTaskProgressWrapper expects a Dict observation space")
         desired_goal_dim = int(np.prod(observation_space["achieved_goal"].shape))
         self.action_dim = int(np.prod(self.action_space.shape))
-        self.phase_names = pickplace_phase_names(self.action_dim, desired_goal_dim)
+        self.default_phase_names = pickplace_phase_names(self.action_dim, desired_goal_dim)
+        self.phase_vocab = tuple(dict.fromkeys(self.default_phase_names + WINDOW_INSERT_PHASE_NAMES))
+        self.phase_names = self.default_phase_names
         self.phase_name = self.phase_names[0]
         self.phase_steps = 0
         self.initial_object_height = 0.0
@@ -62,16 +66,16 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
         self.hint_style = str(hint_style)
 
         base_observation_space = observation_space["observation"]
-        extra_dim = 3 + 3 + 1 + 1 + 1 + len(self.phase_names) + self.action_dim
+        extra_dim = 3 + 3 + 1 + 1 + 1 + len(self.phase_vocab) + self.action_dim
         low = np.concatenate([
             np.asarray(base_observation_space.low, dtype=np.float32),
             np.full(3 + 3 + 1 + 1 + 1 + self.action_dim, -np.inf, dtype=np.float32),
-            np.zeros(len(self.phase_names), dtype=np.float32),
+            np.zeros(len(self.phase_vocab), dtype=np.float32),
         ])
         high = np.concatenate([
             np.asarray(base_observation_space.high, dtype=np.float32),
             np.full(3 + 3 + 1 + 1 + 1 + self.action_dim, np.inf, dtype=np.float32),
-            np.ones(len(self.phase_names), dtype=np.float32),
+            np.ones(len(self.phase_vocab), dtype=np.float32),
         ])
 
         self.observation_space = gym.spaces.Dict({
@@ -80,14 +84,20 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
         })
 
     def _phase_one_hot(self) -> np.ndarray:
-        phase = np.zeros(len(self.phase_names), dtype=np.float32)
-        phase[self.phase_names.index(self.phase_name)] = 1.0
+        phase = np.zeros(len(self.phase_vocab), dtype=np.float32)
+        phase[self.phase_vocab.index(self.phase_name)] = 1.0
         return phase
 
     def _expert_hint_action(self, observation) -> np.ndarray:
         ee_forward_axis = None
+        ee_rotation_matrix = None
+        object_rotation_matrix = None
         if hasattr(self.unwrapped, "get_ee_forward_axis"):
             ee_forward_axis = self.unwrapped.get_ee_forward_axis()
+        if hasattr(self.unwrapped, "get_ee_rotation_matrix"):
+            ee_rotation_matrix = self.unwrapped.get_ee_rotation_matrix()
+        if hasattr(self.unwrapped, "get_object_rotation_matrix"):
+            object_rotation_matrix = self.unwrapped.get_object_rotation_matrix()
         return pickplace_expert_action(
             observation,
             self.phase_name,
@@ -95,6 +105,8 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
             action_dim=self.action_dim,
             hint_style=self.hint_style,
             ee_forward_axis=ee_forward_axis,
+            ee_rotation_matrix=ee_rotation_matrix,
+            object_rotation_matrix=object_rotation_matrix,
         )
 
     def _augment_observation(self, observation):
@@ -126,8 +138,14 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
 
     def _update_phase(self, observation) -> None:
         ee_forward_axis = None
+        ee_rotation_matrix = None
+        object_rotation_matrix = None
         if hasattr(self.unwrapped, "get_ee_forward_axis"):
             ee_forward_axis = self.unwrapped.get_ee_forward_axis()
+        if hasattr(self.unwrapped, "get_ee_rotation_matrix"):
+            ee_rotation_matrix = self.unwrapped.get_ee_rotation_matrix()
+        if hasattr(self.unwrapped, "get_object_rotation_matrix"):
+            object_rotation_matrix = self.unwrapped.get_object_rotation_matrix()
         self.phase_name, self.phase_steps = pickplace_next_phase(
             observation,
             self.phase_name,
@@ -136,13 +154,20 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
             hint_style=self.hint_style,
             action_dim=self.action_dim,
             ee_forward_axis=ee_forward_axis,
+            ee_rotation_matrix=ee_rotation_matrix,
+            object_rotation_matrix=object_rotation_matrix,
         )
 
     def reset(self, **kwargs):
         observation, info = self.env.reset(**kwargs)
+        self.initial_object_height = float(np.asarray(observation["achieved_goal"], dtype=np.float32)[2])
+        self.phase_names = (
+            WINDOW_INSERT_PHASE_NAMES
+            if is_insertion_task(observation, self.initial_object_height)
+            else self.default_phase_names
+        )
         self.phase_name = self.phase_names[0]
         self.phase_steps = 0
-        self.initial_object_height = float(np.asarray(observation["achieved_goal"], dtype=np.float32)[2])
         return self._augment_observation(observation), info
 
     def step(self, action):
@@ -221,23 +246,25 @@ class PickAndPlaceStageFeatureWrapper(gym.ObservationWrapper):
             raise TypeError("PickAndPlaceStageFeatureWrapper expects a Dict observation space")
         desired_goal_dim = int(np.prod(observation_space["achieved_goal"].shape))
         self.action_dim = int(np.prod(self.action_space.shape))
-        self.phase_names = pickplace_phase_names(self.action_dim, desired_goal_dim)
+        self.default_phase_names = pickplace_phase_names(self.action_dim, desired_goal_dim)
+        self.phase_vocab = tuple(dict.fromkeys(self.default_phase_names + WINDOW_INSERT_PHASE_NAMES))
+        self.phase_names = self.default_phase_names
         self.phase_name = self.phase_names[0]
         self.phase_steps = 0
         self.initial_object_height = 0.0
         self.hint_style = str(hint_style)
 
         base_observation_space = observation_space["observation"]
-        extra_dim = 3 + 3 + 1 + 1 + 1 + len(self.phase_names)
+        extra_dim = 3 + 3 + 1 + 1 + 1 + len(self.phase_vocab)
         low = np.concatenate([
             np.asarray(base_observation_space.low, dtype=np.float32),
             np.full(3 + 3 + 1 + 1 + 1, -np.inf, dtype=np.float32),
-            np.zeros(len(self.phase_names), dtype=np.float32),
+            np.zeros(len(self.phase_vocab), dtype=np.float32),
         ])
         high = np.concatenate([
             np.asarray(base_observation_space.high, dtype=np.float32),
             np.full(3 + 3 + 1 + 1 + 1, np.inf, dtype=np.float32),
-            np.ones(len(self.phase_names), dtype=np.float32),
+            np.ones(len(self.phase_vocab), dtype=np.float32),
         ])
 
         self.observation_space = gym.spaces.Dict({
@@ -246,8 +273,8 @@ class PickAndPlaceStageFeatureWrapper(gym.ObservationWrapper):
         })
 
     def _phase_one_hot(self) -> np.ndarray:
-        phase = np.zeros(len(self.phase_names), dtype=np.float32)
-        phase[self.phase_names.index(self.phase_name)] = 1.0
+        phase = np.zeros(len(self.phase_vocab), dtype=np.float32)
+        phase[self.phase_vocab.index(self.phase_name)] = 1.0
         return phase
 
     def _augment_observation(self, observation):
@@ -290,9 +317,14 @@ class PickAndPlaceStageFeatureWrapper(gym.ObservationWrapper):
 
     def reset(self, **kwargs):
         observation, info = self.env.reset(**kwargs)
+        self.initial_object_height = float(np.asarray(observation["achieved_goal"], dtype=np.float32)[2])
+        self.phase_names = (
+            WINDOW_INSERT_PHASE_NAMES
+            if is_insertion_task(observation, self.initial_object_height)
+            else self.default_phase_names
+        )
         self.phase_name = self.phase_names[0]
         self.phase_steps = 0
-        self.initial_object_height = float(np.asarray(observation["achieved_goal"], dtype=np.float32)[2])
         return self._augment_observation(observation), info
 
     def step(self, action):
@@ -430,6 +462,50 @@ class PickAndPlaceDenseRewardWrapper(gym.Wrapper):
         reward += 0.50 * (full_distance < distance_threshold).astype(np.float32)
         return reward.astype(np.float32)
 
+    def _compute_insert_reward(
+        self,
+        achieved_goal: np.ndarray,
+        desired_goal: np.ndarray,
+        info,
+    ) -> np.ndarray:
+        achieved_pos = goal_position(achieved_goal)
+        desired_pos = goal_position(desired_goal)
+        distances = np.linalg.norm(achieved_pos - desired_pos, axis=-1).astype(np.float32)
+        orientation_alignment = np.asarray(goal_alignment(achieved_goal, desired_goal), dtype=np.float32)
+        orientation_error = np.asarray(goal_orientation_error(achieved_goal, desired_goal), dtype=np.float32)
+        inplane_alignment = np.asarray(
+            self._info_array(info, "inplane_alignment", 1.0, distances.shape),
+            dtype=np.float32,
+        )
+        inplane_alignment = np.clip(inplane_alignment, -1.0, 1.0)
+        inplane_error = 1.0 - inplane_alignment
+
+        base = self.unwrapped
+        distance_threshold = float(getattr(base, "window_position_threshold", 0.005))
+        orientation_threshold = float(getattr(base, "orientation_threshold_cos", np.cos(np.deg2rad(5.0))))
+        collision = self._info_array(info, "collision", 0.0, distances.shape)
+        plane_violation = self._info_array(info, "plane_violation", 0.0, distances.shape)
+        geometric_success = (
+            (distances < distance_threshold)
+            & (orientation_alignment >= orientation_threshold)
+            & (inplane_alignment >= orientation_threshold)
+            & (collision <= 0.0)
+            & (plane_violation <= 0.0)
+        )
+
+        reward = -distances
+        reward -= 0.5 * orientation_error
+        reward -= 0.35 * inplane_error
+        reward += 0.5 * (
+            (distances < distance_threshold)
+            & (orientation_alignment >= orientation_threshold)
+            & (inplane_alignment >= orientation_threshold)
+        ).astype(np.float32)
+        reward += 1.0 * geometric_success.astype(np.float32)
+        reward -= 2.0 * collision
+        reward -= 1.0 * plane_violation
+        return reward.astype(np.float32)
+
     def _compute_window_reward(
         self,
         achieved_goal: np.ndarray,
@@ -466,6 +542,12 @@ class PickAndPlaceDenseRewardWrapper(gym.Wrapper):
         ee_object_distance = self._info_array(info, "ee_object_distance", 0.0, distances.shape)
         object_height = self._info_array(info, "object_height", 0.0, distances.shape)
 
+        if self.reward_style == "insert":
+            return self._compute_insert_reward(
+                achieved_goal,
+                desired_goal,
+                info,
+            )
         if self.reward_style == "direct":
             return self._compute_direct_reward(
                 achieved_goal,

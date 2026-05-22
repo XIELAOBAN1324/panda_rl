@@ -116,6 +116,14 @@ def is_pick_and_place_sparse(env_name: str) -> bool:
     return ("PickAndPlace" in env_name) and ("Sparse" in env_name)
 
 
+def is_window_insert_env(env_name: str) -> bool:
+    return "PickAndPlaceWindowInsert" in env_name
+
+
+def is_window_prealign_env(env_name: str) -> bool:
+    return "PickAndPlaceWindowPrealign" in env_name
+
+
 def create_env(
     env_name,
     render_mode=None,
@@ -139,6 +147,11 @@ def create_env(
             env,
             total_env_steps_target=safe_curriculum_total_env_steps or 1_000_000,
         )
+
+    if residual_guidance and is_pick_and_place_sparse(env_name):
+        task_progress_features = True
+        task_stage_features = False
+        task_geometry_features = False
 
     if task_progress_features and is_pick_and_place_sparse(env_name):
         env = PickAndPlaceTaskProgressWrapper(env, hint_style=expert_hint_style)
@@ -288,6 +301,7 @@ def _print_expert_dataset_stats(dataset: ExpertDataset) -> None:
     print(f"  episodes: {len(dataset.episode_successes)}")
     print(f"  transitions: {dataset.num_transitions}")
     print(f"  episode success rate: {dataset.success_rate:.3f}")
+    print(f"  kept transitions: {dataset.num_transitions}")
 
 
 def collect_pickplace_demos_for_training(config: SACConfig) -> Optional[ExpertDataset]:
@@ -320,8 +334,13 @@ def collect_pickplace_demos_for_training(config: SACConfig) -> Optional[ExpertDa
         style=getattr(config, "expert_demo_style", "staged"),
         residual_guidance=getattr(config, "residual_guidance", False),
         residual_scale=getattr(config, "residual_action_scale", 0.1),
+        keep_failed_episodes=False,
+        stop_on_success=True,
     )
     _print_expert_dataset_stats(dataset)
+    if dataset.num_transitions == 0:
+        print("[WARN] No successful expert demo transitions were collected; skipping expert warm-start.")
+        return None
     return dataset
 
 
@@ -360,12 +379,17 @@ def run_behavior_cloning_pretrain(model, dataset: ExpertDataset, config: SACConf
             )
             target_actions = torch.clamp(target_actions, -0.999, 0.999)
             predicted_actions = torch.tanh(mean_actions)
-            predicted_motion = predicted_actions[:, :-1]
-            predicted_gripper = predicted_actions[:, -1:]
-            target_motion = target_actions[:, :-1]
-            target_gripper = target_actions[:, -1:]
-            bc_motion_mse = torch.nn.functional.mse_loss(predicted_motion, target_motion)
-            bc_gripper_mse = torch.nn.functional.mse_loss(predicted_gripper, target_gripper)
+            has_gripper_action = int(target_actions.shape[-1]) in {4, 7}
+            if has_gripper_action:
+                predicted_motion = predicted_actions[:, :-1]
+                predicted_gripper = predicted_actions[:, -1:]
+                target_motion = target_actions[:, :-1]
+                target_gripper = target_actions[:, -1:]
+                bc_motion_mse = torch.nn.functional.mse_loss(predicted_motion, target_motion)
+                bc_gripper_mse = torch.nn.functional.mse_loss(predicted_gripper, target_gripper)
+            else:
+                bc_motion_mse = torch.nn.functional.mse_loss(predicted_actions, target_actions)
+                bc_gripper_mse = torch.zeros((), device=mean_actions.device)
             bc_nll = -distribution.log_prob(target_actions).mean()
             loss = bc_motion_mse + 4.0 * bc_gripper_mse + 0.05 * bc_nll
             optimizer.zero_grad()
@@ -674,6 +698,136 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
     if not is_pick_and_place_sparse(config.env_name):
         return config
 
+    if is_window_prealign_env(config.env_name):
+        config.pickplace_profile = "prealign"
+        if args.reward_scale is None:
+            config.reward_scale = 1.0
+        if args.her is None:
+            # HER relabels the full achieved_goal, including the instantaneous
+            # tool/glass axis. For window insertion that can turn arbitrary
+            # exploration poses into valid goals, so keep it opt-in.
+            config.her = False
+        config.curriculum = False
+        config.safe_curriculum = False
+        if args.n_envs is None:
+            config.n_envs = 1
+        if args.tau is None:
+            config.tau = 0.005
+        if args.learning_rate is None:
+            config.learning_rate = 3e-4
+        if args.batch_size is None:
+            config.batch_size = 512
+        if args.learning_starts is None:
+            config.learning_starts = 5_000
+        if args.gradient_steps is None:
+            config.gradient_steps = max(4, int(config.n_envs))
+        if args.gamma is None:
+            config.gamma = 0.98
+        if args.use_sde is None:
+            config.use_sde = False
+        if args.action_noise_std is None:
+            config.action_noise_std = 0.20
+        if args.ent_coef is None:
+            config.ent_coef = "auto_0.5"
+        if args.target_entropy is None:
+            config.target_entropy = -1.0
+        if getattr(args, "min_ent_coef", None) is None:
+            config.min_ent_coef = 0.01
+        if getattr(args, "dense_reward_shaping", None) is None:
+            config.dense_reward_shaping = True
+        if getattr(args, "dense_reward_style", None) is None:
+            config.dense_reward_style = "insert"
+        if getattr(args, "task_geometry_features", None) is None:
+            config.task_geometry_features = True
+        if getattr(args, "task_stage_features", None) is None:
+            config.task_stage_features = False
+        if getattr(args, "task_progress_features", None) is None:
+            config.task_progress_features = False
+        if getattr(args, "residual_guidance", None) is None:
+            config.residual_guidance = False
+        if args.normalize_env is None:
+            config.normalize_env = False
+        if config.dense_reward_shaping:
+            config.copy_info_dict = True
+        if args.n_sampled_goal is None:
+            config.n_sampled_goal = 8
+        if args.goal_selection_strategy is None:
+            config.goal_selection_strategy = "future"
+        if int(getattr(args, "expert_demo_episodes", 0)) > 0 and getattr(args, "expert_demo_style", None) is None:
+            config.expert_demo_style = "insert"
+        if getattr(args, "expert_hint_style", None) is None:
+            config.expert_hint_style = "insert"
+        if int(getattr(args, "expert_demo_episodes", 0)) > 0 and config.bc_learning_rate is None:
+            config.bc_learning_rate = 3e-4
+        if int(getattr(args, "expert_demo_episodes", 0)) > 0 and getattr(args, "demo_prefill_passes", 1) <= 1:
+            config.demo_prefill_passes = 8
+        return config
+
+    if is_window_insert_env(config.env_name):
+        config.pickplace_profile = "insert"
+        if args.reward_scale is None:
+            config.reward_scale = 1.0
+        if args.her is None:
+            # HER relabels the full achieved_goal, including the instantaneous
+            # tool/glass axis. For window insertion that can turn arbitrary
+            # exploration poses into valid goals, so keep it opt-in.
+            config.her = False
+        config.curriculum = False
+        config.safe_curriculum = False
+        if args.n_envs is None:
+            config.n_envs = 1
+        if args.tau is None:
+            config.tau = 0.005
+        if args.learning_rate is None:
+            config.learning_rate = 3e-4
+        if args.batch_size is None:
+            config.batch_size = 512
+        if args.learning_starts is None:
+            config.learning_starts = 5_000
+        if args.gradient_steps is None:
+            config.gradient_steps = max(4, int(config.n_envs))
+        if args.gamma is None:
+            config.gamma = 0.98
+        if args.use_sde is None:
+            config.use_sde = False
+        if args.action_noise_std is None:
+            config.action_noise_std = 0.20
+        if args.ent_coef is None:
+            config.ent_coef = "auto_0.5"
+        if args.target_entropy is None:
+            config.target_entropy = -1.0
+        if getattr(args, "min_ent_coef", None) is None:
+            config.min_ent_coef = 0.01
+        if getattr(args, "dense_reward_shaping", None) is None:
+            config.dense_reward_shaping = True
+        if getattr(args, "dense_reward_style", None) is None:
+            config.dense_reward_style = "insert"
+        if getattr(args, "task_geometry_features", None) is None:
+            config.task_geometry_features = True
+        if getattr(args, "task_stage_features", None) is None:
+            config.task_stage_features = False
+        if getattr(args, "task_progress_features", None) is None:
+            config.task_progress_features = False
+        if getattr(args, "residual_guidance", None) is None:
+            config.residual_guidance = False
+        if args.normalize_env is None:
+            config.normalize_env = False
+        if config.dense_reward_shaping:
+            config.copy_info_dict = True
+        if args.n_sampled_goal is None:
+            config.n_sampled_goal = 8
+        if args.goal_selection_strategy is None:
+            config.goal_selection_strategy = "future"
+        if int(getattr(args, "expert_demo_episodes", 0)) > 0 and getattr(args, "expert_demo_style", None) is None:
+            config.expert_demo_style = "insert"
+        if getattr(args, "expert_hint_style", None) is None:
+            config.expert_hint_style = "insert"
+        if int(getattr(args, "expert_demo_episodes", 0)) > 0 and config.bc_learning_rate is None:
+            config.bc_learning_rate = 3e-4
+        if int(getattr(args, "expert_demo_episodes", 0)) > 0 and getattr(args, "demo_prefill_passes", 1) <= 1:
+            config.demo_prefill_passes = 8
+        return config
+
     profile = getattr(args, "pickplace_profile", "auto")
     if profile == "auto":
         profile = "strong"
@@ -824,7 +978,7 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
 
     if config.n_envs > 8:
         print(
-            "[WARN] FrankaPickAndPlaceSparse-v0 usually trains more reliably with "
+            "[WARN] FrankaPickAndPlaceWindowSparse-v0 usually trains more reliably with "
             "small n_envs (1-8). Current n_envs="
             f"{config.n_envs}."
         )
@@ -832,8 +986,8 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SAC 训练脚本（以 HER 为核心的 pick-and-place sparse 默认配置，移除 curriculum 版）")
-    parser.add_argument("--env", type=str, default="FrankaSlideDense-v0", help="环境名称")
+    parser = argparse.ArgumentParser(description="SAC 训练脚本（默认仅保留 PickAndPlaceWindow 任务）")
+    parser.add_argument("--env", type=str, default="FrankaPickAndPlaceWindowDense-v0", help="环境名称")
     parser.add_argument("--timesteps", type=int, default=1_000_000, help="总训练步数")
     parser.add_argument("--exp-name", type=str, default=None, help="实验名称")
     parser.add_argument("--reward-scale", type=float, default=None, help="奖励缩放（未指定时使用各环境默认值）")
@@ -883,14 +1037,14 @@ def main():
         "--expert-demo-style",
         type=str,
         default=None,
-        choices=["staged", "direct"],
+        choices=["staged", "direct", "insert"],
         help="expert demo trajectory 风格",
     )
     parser.add_argument(
         "--expert-hint-style",
         type=str,
         default=None,
-        choices=["staged", "direct"],
+        choices=["staged", "direct", "insert"],
         help="用于 task-progress / residual guidance 的 expert hint 风格",
     )
     parser.add_argument("--bc-epochs", type=int, default=0, help="使用 expert demo 进行 actor behavior cloning 预训练的 epoch 数")
@@ -905,7 +1059,7 @@ def main():
         "--dense-reward-style",
         type=str,
         default=None,
-        choices=["standard", "direct"],
+        choices=["standard", "direct", "insert"],
         help="dense shaping 奖励形式",
     )
     parser.add_argument(
@@ -913,7 +1067,7 @@ def main():
         type=str,
         default="auto",
         choices=["auto", "strong", "legacy", "direct"],
-        help="FrankaPickAndPlaceSparse-v0 专用预设（auto 与 strong 相同）",
+        help="FrankaPickAndPlaceWindowSparse-v0 专用预设（auto 与 strong 相同）",
     )
     parser.add_argument("--no-tf32", action="store_true", help="禁用 Ampere 及以上 GPU 的 TF32")
 

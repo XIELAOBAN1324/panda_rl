@@ -11,12 +11,8 @@ def test_single_env(env_id, steps=500, sleep_time=0.1):
     
     # Descriptions of each environment
     descriptions = {
-        "FrankaPickAndPlaceSparse-v0": "🤖 Pick & Place (Sparse Reward): Grab green blocks and move to red targets",
-        "FrankaPickAndPlaceDense-v0": "🤖 Pick & Place (Dense Reward): Distance-based continuous rewards",
-        "FrankaPushSparse-v0": "👋 Push (Sparse Reward): Block the gripper, push to the target",
-        "FrankaPushDense-v0": "👋 Push (Dense Reward): Block the gripper, distance-based rewards",
-        "FrankaSlideSparse-v0": "🧊 Slide (Sparse Reward): Hit on a slippery surface",
-        "FrankaSlideDense-v0": "🧊 Slide (Dense Reward): Slippery surface, distance-based rewards"
+        "FrankaPickAndPlaceWindowSparse-v0": "🪟 Window Pick & Place (Sparse Reward): Attach object and insert through the window",
+        "FrankaPickAndPlaceWindowDense-v0": "🪟 Window Pick & Place (Dense Reward): Position and orientation shaping for window insertion",
     }
     
     if env_id in descriptions:
@@ -62,7 +58,7 @@ def test_single_env(env_id, steps=500, sleep_time=0.1):
 
 def main():
     """Main execution function"""
-    print("🚀 Panda MuJoCo Gym - Test All Environments")
+    print("🚀 Panda MuJoCo Gym - Test Window Environments")
     print("=" * 70)
     print("💡 Test each environment in order.")
     print("💡 Press Ctrl+C to interrupt.")

@@ -20,7 +20,7 @@ class BaseConfig:
     """基础配置类"""
 
     # 环境设置
-    env_name: str = "FrankaSlideDense-v0"
+    env_name: str = "FrankaPickAndPlaceWindowDense-v0"
     algorithm: str = "SAC"
 
     # 训练设置

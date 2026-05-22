@@ -1,8 +1,13 @@
-from .evaluate_with_video import evaluate_experiment
-from .video_recorder import EpisodeVideoRecorder, StageVideoRecorder
+from .video_recorder import EpisodeVideoRecorder
 
-__all__ = [
-    'evaluate_experiment',
-    'EpisodeVideoRecorder', 
-    'StageVideoRecorder'
-]
+try:
+    from .evaluate_with_video import evaluate_experiment
+except ModuleNotFoundError:
+    evaluate_experiment = None
+
+try:
+    from .video_recorder import StageVideoRecorder
+except ImportError:
+    StageVideoRecorder = None
+
+__all__ = ["evaluate_experiment", "EpisodeVideoRecorder", "StageVideoRecorder"]

@@ -5,7 +5,7 @@ import gymnasium as gym
 import panda_mujoco_gym
 
 if __name__ == "__main__":
-    env = gym.make("FrankaPickAndPlaceSparse-v0", render_mode="human")
+    env = gym.make("FrankaPickAndPlaceWindowSparse-v0", render_mode="human")
 
     observation, info = env.reset()
 

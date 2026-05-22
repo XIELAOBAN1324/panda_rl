@@ -6,6 +6,7 @@ import os
 import cv2
 import json
 import shutil
+import subprocess
 from typing import List, Dict, Optional, Any
 
 import numpy as np
@@ -32,23 +33,23 @@ class EpisodeVideoRecorder:
         self.fps = fps
         self.current_episode_frames = []
         self.episode_metadata = []
+        self.last_error = ""
         os.makedirs(save_dir, exist_ok=True)
 
     def start_episode_recording(self):
-        """开始录制新回合"""
         self.current_episode_frames = []
+        self.last_error = ""
 
     def add_frame(self, frame: np.ndarray):
-        """向当前回合添加帧"""
         if frame is not None:
             self.current_episode_frames.append(frame.copy())
 
     def end_episode_recording(self, episode_info: Dict) -> Optional[str]:
-        """结束回合录制并保存视频"""
         if not self.current_episode_frames:
+            self.last_error = "no rendered frames were captured"
+            print(f"⚠️ 视频保存失败: {self.last_error}")
             return None
 
-        stage = episode_info.get("stage", "unknown")
         episode_id = int(episode_info.get("episode_id", 0))
         success_str = "SUCCESS" if bool(episode_info.get("success", False)) else "FAIL"
         reward = float(episode_info.get("reward", 0.0))
@@ -69,32 +70,76 @@ class EpisodeVideoRecorder:
             safe_info["frame_count"] = int(len(self.current_episode_frames))
             safe_info["fps"] = int(self.fps)
             safe_info["duration"] = float(len(self.current_episode_frames) / self.fps)
-
-            safe_info = _to_json_safe(safe_info)
-            self.episode_metadata.append(safe_info)
-
-            print(f"   ✅ 视频已保存: {filename}")
-            print(
-                f"      帧数: {len(self.current_episode_frames)}, "
-                f"成功: {success_str}, 奖励: {reward:.2f}"
-            )
+            self.episode_metadata.append(_to_json_safe(safe_info))
             return video_path
-
+        print(f"⚠️ 视频保存失败: {self.last_error or 'unknown ffmpeg error'}")
         return None
 
-    def _save_video(self, video_path: str, frames: List[np.ndarray]) -> bool:
-        if not frames:
-            return False
+    def _prepare_frames(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        prepared = []
+        first = np.asarray(frames[0])
+        height, width = first.shape[:2]
+        target_height = max(2, height - (height % 2))
+        target_width = max(2, width - (width % 2))
 
+        for frame in frames:
+            frame = np.asarray(frame)
+            if frame.ndim == 2:
+                frame = np.repeat(frame[:, :, None], 3, axis=2)
+            if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
+                raise ValueError(f"unsupported frame shape: {frame.shape}")
+            if frame.shape[-1] == 4:
+                frame = frame[:, :, :3]
+            if frame.dtype != np.uint8:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            if frame.shape[:2] != (height, width):
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            if frame.shape[:2] != (target_height, target_width):
+                frame = frame[:target_height, :target_width]
+            prepared.append(np.ascontiguousarray(frame))
+        return prepared
+
+    def _ffmpeg_candidates(self) -> List[str]:
+        candidates = []
+        for key in ("PANDA_RL_FFMPEG", "FFMPEG_BINARY"):
+            value = os.environ.get(key)
+            if value:
+                candidates.append(value)
+
+        path_ffmpeg = shutil.which("ffmpeg")
+        if path_ffmpeg:
+            candidates.append(path_ffmpeg)
+
+        candidates.extend(["/usr/bin/ffmpeg", "/bin/ffmpeg"])
+
+        seen = set()
+        unique = []
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            unique.append(candidate)
+        return unique
+
+    def _remove_incomplete_video(self, video_path: str) -> None:
         try:
-            import subprocess
-            import numpy as np
+            if os.path.exists(video_path):
+                os.remove(video_path)
+        except OSError:
+            pass
 
-            height, width = frames[0].shape[:2]
+    def _save_video_with_ffmpeg(self, video_path: str, frames: List[np.ndarray]) -> bool:
+        height, width = frames[0].shape[:2]
+        raw_video = b"".join(frame.tobytes() for frame in frames)
+        errors = []
 
+        for ffmpeg in self._ffmpeg_candidates():
+            if os.path.sep in ffmpeg and not os.path.exists(ffmpeg):
+                continue
             cmd = [
-                "ffmpeg",
+                ffmpeg,
                 "-y",
+                "-loglevel", "error",
                 "-f", "rawvideo",
                 "-vcodec", "rawvideo",
                 "-pix_fmt", "rgb24",
@@ -110,224 +155,87 @@ class EpisodeVideoRecorder:
                 video_path,
             ]
 
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                _, stderr_bytes = proc.communicate(input=raw_video)
+            except Exception as exc:
+                errors.append(f"{ffmpeg}: {exc}")
+                self._remove_incomplete_video(video_path)
+                continue
+
+            stderr = stderr_bytes.decode("utf-8", errors="replace").strip() if stderr_bytes else ""
+            success = proc.returncode == 0 and os.path.exists(video_path) and os.path.getsize(video_path) > 0
+            if success:
+                return True
+
+            errors.append(f"{ffmpeg}: {stderr or f'exited with code {proc.returncode}'}")
+            self._remove_incomplete_video(video_path)
+
+        self.last_error = "; ".join(errors) if errors else "no ffmpeg executable found"
+        return False
+
+    def _save_video_with_opencv(self, video_path: str, frames: List[np.ndarray]) -> bool:
+        height, width = frames[0].shape[:2]
+        errors = []
+
+        for codec in ("mp4v", "XVID", "MJPG"):
+            writer = cv2.VideoWriter(
+                video_path,
+                cv2.VideoWriter_fourcc(*codec),
+                float(self.fps),
+                (int(width), int(height)),
+            )
+            if not writer.isOpened():
+                errors.append(f"OpenCV VideoWriter could not open codec {codec}")
+                writer.release()
+                self._remove_incomplete_video(video_path)
+                continue
 
             for frame in frames:
-                if frame is None:
-                    continue
-                if frame.dtype != np.uint8:
-                    frame = frame.astype(np.uint8)
-                if frame.shape[:2] != (height, width):
-                    frame = cv2.resize(frame, (width, height))
-                # 这里假设 frame 是 RGB
-                proc.stdin.write(frame.tobytes())
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            writer.release()
 
-            proc.stdin.close()
-            proc.wait()
+            success = os.path.exists(video_path) and os.path.getsize(video_path) > 0
+            if success:
+                return True
 
-            return proc.returncode == 0 and os.path.exists(video_path) and os.path.getsize(video_path) > 0
+            errors.append(f"OpenCV VideoWriter codec {codec} produced no output")
+            self._remove_incomplete_video(video_path)
 
-        except Exception as e:
-            print(f"❌ 保存视频出错: {e}")
+        self.last_error = "; ".join(errors) if errors else "OpenCV VideoWriter failed"
+        return False
+
+    def _save_video(self, video_path: str, frames: List[np.ndarray]) -> bool:
+        if not frames:
+            self.last_error = "no frames to encode"
             return False
 
+        try:
+            prepared_frames = self._prepare_frames(frames)
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+        ffmpeg_error = ""
+        if self._save_video_with_ffmpeg(video_path, prepared_frames):
+            return True
+        ffmpeg_error = self.last_error
+
+        if self._save_video_with_opencv(video_path, prepared_frames):
+            self.last_error = ""
+            return True
+
+        opencv_error = self.last_error
+        self.last_error = f"ffmpeg failed ({ffmpeg_error}); OpenCV fallback failed ({opencv_error})"
+        return False
+
     def save_metadata(self):
-        """将回合元数据保存为 JSON"""
         if self.episode_metadata:
             metadata_path = os.path.join(self.save_dir, "episode_metadata.json")
             with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(_to_json_safe(self.episode_metadata), f, indent=4, ensure_ascii=False)
-            print(f"   📝 元数据已保存: {metadata_path}")
-
-
-class StageVideoRecorder:
-    """按训练阶段录制视频的系统"""
-
-    def __init__(self, base_dir: str, fps: int = 30):
-        self.base_dir = base_dir
-        self.fps = fps
-        self.stage_results = {}
-        self.best_episodes = []
-        os.makedirs(base_dir, exist_ok=True)
-
-    def record_stage_episodes(self, stage_name: str, model, env, num_episodes: int = 3):
-        """录制指定阶段的多个回合"""
-        print(f"\n🎬 [{stage_name}] 开始录制视频（{num_episodes}个回合）")
-
-        stage_dir = os.path.join(self.base_dir, stage_name)
-        os.makedirs(stage_dir, exist_ok=True)
-
-        recorder = EpisodeVideoRecorder(stage_dir, fps=self.fps)
-        episode_results = []
-        successful_episodes = []
-        failed_episodes = []
-
-        attempts = 0
-        max_attempts = num_episodes * 5
-
-        while len(episode_results) < num_episodes and attempts < max_attempts:
-            attempts += 1
-
-            result = self._record_single_episode(
-                recorder, model, env, len(episode_results), stage_name
-            )
-
-            if result:
-                if result["success"]:
-                    successful_episodes.append(result)
-                else:
-                    failed_episodes.append(result)
-
-            if len(successful_episodes) >= num_episodes:
-                episode_results = successful_episodes[:num_episodes]
-                break
-            elif attempts >= max_attempts - 1:
-                episode_results = (successful_episodes + failed_episodes)[:num_episodes]
-                break
-
-        recorder.save_metadata()
-
-        self.stage_results[stage_name] = episode_results
-
-        for result in episode_results:
-            if (
-                not self.best_episodes
-                or float(result["reward"]) > min(float(ep["reward"]) for ep in self.best_episodes)
-            ):
-                self.best_episodes.append(_to_json_safe(result))
-                self.best_episodes.sort(key=lambda x: float(x["reward"]), reverse=True)
-                self.best_episodes = self.best_episodes[:10]
-
-        success_count = sum(1 for r in episode_results if r.get("success", False))
-        avg_reward = np.mean([float(r["reward"]) for r in episode_results]) if episode_results else 0.0
-
-        print(f"✅ [{stage_name}] 完成！")
-        print(f"   已录制回合: {len(episode_results)}个")
-        print(f"   成功率: {success_count}/{len(episode_results)}")
-        print(f"   平均奖励: {avg_reward:.2f}")
-
-        return episode_results
-
-    def _record_single_episode(self, recorder, model, env, episode_idx, stage_name):
-        """录制单个回合"""
-        recorder.start_episode_recording()
-
-        obs = env.reset()
-        total_reward = 0.0
-        step_count = 0
-        done = False
-        success = False
-
-        for _ in range(3):
-            rendered = env.render()
-            if rendered is not None:
-                img = rendered[0] if isinstance(rendered, (list, tuple)) else rendered
-                recorder.add_frame(img)
-
-        while not done:
-            if model is not None:
-                action, _ = model.predict(obs, deterministic=True)
-            else:
-                raw_action = env.action_space.sample()
-                action = np.array([raw_action])
-
-            obs, rewards, dones, infos = env.step(action)
-
-            done = bool(dones[0])
-            total_reward += float(rewards[0])
-            step_count += 1
-
-            rendered = env.render()
-            if rendered is not None:
-                img = rendered[0] if isinstance(rendered, (list, tuple)) else rendered
-                recorder.add_frame(img)
-
-            if bool(infos[0].get("is_success", False)):
-                success = True
-                for _ in range(15):
-                    rendered = env.render()
-                    if rendered is not None:
-                        img = rendered[0] if isinstance(rendered, (list, tuple)) else rendered
-                        recorder.add_frame(img)
-                break
-
-            if step_count > 1000:
-                break
-
-        episode_info = {
-            "episode_id": int(episode_idx),
-            "reward": float(total_reward),
-            "length": int(step_count),
-            "success": bool(success),
-            "stage": str(stage_name),
-        }
-
-        video_path = recorder.end_episode_recording(episode_info)
-        if video_path:
-            episode_info["video_path"] = str(video_path)
-            return _to_json_safe(episode_info)
-
-        return None
-
-    def create_highlight_reel(self):
-        """根据最高奖励回合生成高光视频"""
-        if not self.best_episodes:
-            print("❌ 生成高光失败：没有回合")
-            return
-
-        print(f"\n📦 正在创建高光文件夹...（前 {len(self.best_episodes)} 个回合）")
-
-        highlight_dir = os.path.join(self.base_dir, "highlights")
-        os.makedirs(highlight_dir, exist_ok=True)
-
-        for i, episode in enumerate(self.best_episodes):
-            if "video_path" in episode and os.path.exists(episode["video_path"]):
-                original_path = episode["video_path"]
-                highlight_filename = (
-                    f"best_{i+1:02d}_reward{float(episode['reward']):.1f}_{episode['stage']}.mp4"
-                )
-                highlight_path = os.path.join(highlight_dir, highlight_filename)
-
-                shutil.copy2(original_path, highlight_path)
-                print(f"   ✨ {highlight_filename}")
-
-        highlight_metadata = {
-            "best_episodes": _to_json_safe(self.best_episodes),
-            "total_stages_evaluated": int(len(self.stage_results)),
-            "stages": [str(x) for x in self.stage_results.keys()],
-        }
-
-        metadata_path = os.path.join(highlight_dir, "highlight_metadata.json")
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(highlight_metadata, f, indent=4, ensure_ascii=False)
-
-        print(f"✅ 高光完成！{highlight_dir}")
-
-    def save_evaluation_summary(self):
-        """保存整体评估摘要"""
-        summary = {
-            "stages_evaluated": [str(x) for x in self.stage_results.keys()],
-            "total_episodes": int(sum(len(episodes) for episodes in self.stage_results.values())),
-            "stage_summaries": {},
-        }
-
-        for stage, episodes in self.stage_results.items():
-            if episodes:
-                rewards = [float(ep["reward"]) for ep in episodes]
-                successes = [bool(ep["success"]) for ep in episodes]
-
-                summary["stage_summaries"][stage] = {
-                    "num_episodes": int(len(episodes)),
-                    "mean_reward": float(np.mean(rewards)),
-                    "std_reward": float(np.std(rewards)),
-                    "success_rate": float(sum(successes) / len(successes)),
-                    "best_reward": float(max(rewards)),
-                    "worst_reward": float(min(rewards)),
-                }
-
-        summary_path = os.path.join(self.base_dir, "evaluation_summary.json")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(_to_json_safe(summary), f, indent=4, ensure_ascii=False)
-
-        print(f"\n📊 评估摘要已保存: {summary_path}")
-        return summary

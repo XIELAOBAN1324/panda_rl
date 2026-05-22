@@ -29,7 +29,7 @@ class CurriculumStage:
 
 
 class PickAndPlaceCurriculumWrapper(gym.Wrapper):
-    """用于让 FrankaPickAndPlaceSparse 更容易起步的激进 curriculum。
+    """用于让 PickAndPlaceWindow 任务更容易起步的激进 curriculum。
 
     核心思路
     - 初始阶段缩小 object spawn 范围。
@@ -203,10 +203,6 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
         hover[2] = max(float(object_pos[2] + stage.ee_hover_height), float(base.initial_object_height + 0.08))
         base.set_mocap_pose(hover, base.grasp_site_pose)
 
-        if hasattr(base, "ctrl_range") and getattr(base, "block_gripper", True) is False:
-            open_half_width = float(np.clip(0.04, base.ctrl_range[-1, 0], base.ctrl_range[-1, 1]))
-            base.data.ctrl[-2:] = open_half_width
-
         for _ in range(max(stage.settle_steps, 0)):
             base._mujoco_step()
         base._mujoco.mj_forward(base.model, base.data)
@@ -245,7 +241,7 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
         ee_position = np.array(obs["observation"][:3], dtype=np.float64)
         object_position = np.array(goal_position(obs["achieved_goal"]), dtype=np.float64)
         goal_pos = np.array(goal_position(obs["desired_goal"]), dtype=np.float64)
-        fingers_width = float(obs["observation"][6]) if obs["observation"].shape[0] > 6 else 0.0
+        suction_state = float(obs["observation"][-1]) if obs["observation"].shape[0] > 0 else 0.0
 
         reach_dist = float(np.linalg.norm(ee_position - object_position))
         goal_dist = float(np.linalg.norm(object_position - goal_pos))
@@ -254,7 +250,7 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
         reach_term = np.exp(-12.0 * reach_dist)
         goal_term = np.exp(-8.0 * goal_dist)
         lift_term = np.clip(lift_height / 0.10, 0.0, 1.0)
-        grasp_hint = 1.0 if (reach_dist < 0.035 and fingers_width < 0.06) else 0.0
+        grasp_hint = 1.0 if (reach_dist < 0.035 and suction_state < 0.0) else 0.0
 
         bonus = (
             0.35 * reach_term
@@ -263,7 +259,10 @@ class PickAndPlaceCurriculumWrapper(gym.Wrapper):
             + 0.15 * grasp_hint
         )
         if is_window_goal(obs["desired_goal"]):
-            alignment = float(np.asarray(obs["achieved_goal"], dtype=np.float64)[3:6] @ np.asarray(obs["desired_goal"], dtype=np.float64)[3:6])
+            alignment = float(
+                np.asarray(obs["achieved_goal"], dtype=np.float64)[3:6]
+                @ np.asarray(obs["desired_goal"], dtype=np.float64)[3:6]
+            )
             bonus += 0.20 * max(alignment, 0.0)
         return float(self.current_stage.shaping_scale * bonus)
 
@@ -485,10 +484,6 @@ class SafePickAndPlaceCurriculumWrapper(gym.Wrapper):
             float(base.initial_object_height + 0.08),
         )
         base.set_mocap_pose(hover, base.grasp_site_pose)
-
-        if hasattr(base, "ctrl_range") and getattr(base, "block_gripper", True) is False:
-            open_half_width = float(np.clip(0.04, base.ctrl_range[-1, 0], base.ctrl_range[-1, 1]))
-            base.data.ctrl[-2:] = open_half_width
 
         for _ in range(max(stage.settle_steps, 0)):
             base._mujoco_step()
