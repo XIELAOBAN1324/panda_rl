@@ -497,6 +497,7 @@ def _make_summary(config, training_time, mean_reward, std_reward, training_callb
         "best_reward": float(training_callback.best_reward),
         "final_success_rate": float(training_callback.recent_success_rate),
         "final_any_success_rate": float(getattr(training_callback, "recent_any_success_rate", 0.0)),
+        "final_lost_success_rate": float(getattr(training_callback, "recent_lost_success_rate", 0.0)),
         "total_episodes": int(training_callback.episode_count),
         "config": serializable_config,
     }
@@ -511,6 +512,15 @@ def _save_summary(summary, *paths):
 
 def train_sac(config: SACConfig):
     configure_runtime(config)
+    if (
+        bool(getattr(config, "her", False))
+        and bool(getattr(config, "dense_reward_shaping", False))
+        and str(getattr(config, "dense_reward_style", "")) == "insert"
+    ):
+        raise ValueError(
+            "HER is incompatible with dense_reward_style='insert': the reward uses "
+            "goal-specific glass_fits_window/collision geometry that cannot be safely relabeled."
+        )
 
     print("🚀 开始 SAC 训练！")
     print(f"🎯 环境: {config.env_name}")

@@ -129,6 +129,7 @@ def collect_pickplace_expert_dataset(
                 ee_forward_axis=ee_forward_axis,
                 ee_rotation_matrix=ee_rotation_matrix,
                 object_rotation_matrix=object_rotation_matrix,
+                phase_steps=phase_steps,
             )
             current_hint_action = None
             if residual_guidance and hasattr(env, "get_wrapper_attr"):

@@ -2,6 +2,7 @@ import gymnasium as gym
 import numpy as np
 
 import panda_mujoco_gym  # noqa: F401
+from evaluate.evaluate_with_video import _episode_failure_reasons, _write_summary
 from train.common.expert_pickplace import collect_pickplace_expert_dataset
 from train.common.config import SACConfig
 from train.common.wrappers import PickAndPlaceDenseRewardWrapper
@@ -406,6 +407,7 @@ def test_pickplace_insert_shaping_penalizes_inplane_misalignment():
                 {
                     "collision": False,
                     "plane_violation": False,
+                    "glass_fits_window": True,
                     "inplane_alignment": 1.0,
                 },
             )
@@ -417,6 +419,7 @@ def test_pickplace_insert_shaping_penalizes_inplane_misalignment():
                 {
                     "collision": False,
                     "plane_violation": False,
+                    "glass_fits_window": True,
                     "inplane_alignment": 0.0,
                 },
             )
@@ -427,7 +430,7 @@ def test_pickplace_insert_shaping_penalizes_inplane_misalignment():
         env.close()
 
 
-def test_pickplace_insert_shaping_ignores_goal_specific_glass_fit_info():
+def test_pickplace_insert_shaping_requires_glass_fit_info():
     env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
     try:
         env.reset(seed=0)
@@ -441,6 +444,7 @@ def test_pickplace_insert_shaping_ignores_goal_specific_glass_fit_info():
                     "collision": False,
                     "plane_violation": False,
                     "glass_fits_window": False,
+                    "inplane_alignment": 1.0,
                 },
             )
         )
@@ -452,34 +456,230 @@ def test_pickplace_insert_shaping_ignores_goal_specific_glass_fit_info():
                     "collision": False,
                     "plane_violation": False,
                     "glass_fits_window": True,
+                    "inplane_alignment": 1.0,
                 },
             )
         )
 
-        assert np.isclose(false_fit_reward, true_fit_reward)
+        assert false_fit_reward < true_fit_reward - 0.4
+        assert false_fit_reward <= 0.0
     finally:
         env.close()
 
 
-def test_pickplace_expert_dataset_filters_failed_insert_seed():
+def test_pickplace_insert_shaping_penalizes_collision_and_plane_violation():
+    env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        env.reset(seed=0)
+        achieved_goal = env.unwrapped.goal.copy()
+        desired_goal = env.unwrapped.goal.copy()
+        clean_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                {
+                    "collision": False,
+                    "plane_violation": False,
+                    "glass_fits_window": True,
+                    "inplane_alignment": 1.0,
+                },
+            )
+        )
+        collision_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                {
+                    "collision": True,
+                    "plane_violation": False,
+                    "glass_fits_window": True,
+                    "inplane_alignment": 1.0,
+                },
+            )
+        )
+        plane_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                {
+                    "collision": False,
+                    "plane_violation": True,
+                    "glass_fits_window": True,
+                    "inplane_alignment": 1.0,
+                },
+            )
+        )
+
+        assert clean_reward > 0.0
+        assert collision_reward < clean_reward - 0.9
+        assert plane_reward < clean_reward - 0.9
+    finally:
+        env.close()
+
+
+def test_pickplace_insert_dense_env_and_wrapper_reward_ordering_match():
+    dense_env = gym.make("FrankaPickAndPlaceWindowInsertDense-v0")
+    wrapper_env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        dense_env.reset(seed=0)
+        wrapper_env.reset(seed=0)
+        achieved_goal = dense_env.unwrapped.goal.copy()
+        desired_goal = dense_env.unwrapped.goal.copy()
+        clean_info = {
+            "collision": False,
+            "plane_violation": False,
+            "glass_fits_window": True,
+            "inplane_alignment": 1.0,
+        }
+        bad_info = {
+            "collision": False,
+            "plane_violation": False,
+            "glass_fits_window": False,
+            "inplane_alignment": 1.0,
+        }
+
+        dense_clean = float(dense_env.unwrapped.compute_reward(achieved_goal, desired_goal, clean_info))
+        dense_bad = float(dense_env.unwrapped.compute_reward(achieved_goal, desired_goal, bad_info))
+        wrapper_clean = float(wrapper_env.compute_reward(achieved_goal, desired_goal, clean_info))
+        wrapper_bad = float(wrapper_env.compute_reward(achieved_goal, desired_goal, bad_info))
+
+        assert dense_clean > dense_bad
+        assert wrapper_clean > wrapper_bad
+        assert np.isclose(dense_clean - dense_bad, wrapper_clean - wrapper_bad)
+    finally:
+        dense_env.close()
+        wrapper_env.close()
+
+
+def test_evaluate_failure_reasons_mark_lost_success():
+    thresholds = {
+        "position_threshold": 0.005,
+        "orientation_threshold": 0.99,
+        "inplane_threshold": 0.99,
+    }
+    primary, reasons = _episode_failure_reasons(
+        terminal_info={
+            "collision": True,
+            "plane_violation": True,
+            "glass_fits_window": False,
+            "position_error": 0.004,
+            "orientation_alignment": 1.0,
+            "inplane_alignment": 1.0,
+        },
+        terminal_success=False,
+        any_success=True,
+        timed_out=False,
+        thresholds=thresholds,
+    )
+
+    assert primary == "lost_success"
+    assert reasons == ["collision", "plane_violation", "glass_not_fit_window"]
+
+
+def test_evaluation_summary_uses_terminal_success_and_counts_failure_reasons(tmp_path):
+    episodes = [
+        {
+            "reward": 1.0,
+            "length": 10,
+            "success": True,
+            "any_success": True,
+            "lost_success": False,
+            "primary_failure_reason": "success",
+            "failure_reasons": [],
+            "position_threshold": 0.005,
+            "orientation_threshold": 0.99,
+            "inplane_threshold": 0.99,
+        },
+        {
+            "reward": -1.0,
+            "length": 20,
+            "success": False,
+            "any_success": True,
+            "lost_success": True,
+            "primary_failure_reason": "lost_success",
+            "failure_reasons": ["collision", "plane_violation"],
+            "position_threshold": 0.005,
+            "orientation_threshold": 0.99,
+            "inplane_threshold": 0.99,
+        },
+        {
+            "reward": -2.0,
+            "length": 30,
+            "success": False,
+            "any_success": False,
+            "lost_success": False,
+            "primary_failure_reason": "glass_not_fit_window",
+            "failure_reasons": ["glass_not_fit_window", "timeout"],
+            "position_threshold": 0.005,
+            "orientation_threshold": 0.99,
+            "inplane_threshold": 0.99,
+        },
+    ]
+
+    summary_path = _write_summary(
+        output_dir=tmp_path,
+        model_path=tmp_path / "model.zip",
+        vecnormalize_path=None,
+        config={"env_name": "FrankaPickAndPlaceWindowInsertSparse-v0"},
+        episodes=episodes,
+    )
+
+    import json
+
+    summary = json.loads(summary_path.read_text())
+    assert np.isclose(summary["success_rate"], 1 / 3)
+    assert np.isclose(summary["terminal_success_rate"], 1 / 3)
+    assert np.isclose(summary["any_success_rate"], 2 / 3)
+    assert np.isclose(summary["lost_success_rate"], 1 / 3)
+    assert summary["failure_reason_counts"]["collision"] == 1
+    assert summary["failure_reason_counts"]["plane_violation"] == 1
+    assert summary["failure_reason_counts"]["glass_not_fit_window"] == 1
+    assert summary["failure_reason_counts"]["timeout"] == 1
+    assert summary["failure_reason_counts"]["lost_success"] == 1
+
+
+def test_pickplace_expert_dataset_succeeds_on_previous_insert_failures():
+    def make_env():
+        return gym.make("FrankaPickAndPlaceWindowInsertSparse-v0")
+
+    previous_failure_seeds = [3, 11, 25, 29, 32, 34, 36, 44, 53, 54]
+    terminal_infos = []
+    for seed in previous_failure_seeds:
+        dataset = collect_pickplace_expert_dataset(
+            make_env,
+            num_episodes=1,
+            seed_start=seed,
+            style="insert",
+            keep_failed_episodes=True,
+            stop_on_success=True,
+        )
+        assert dataset.episode_successes == [True]
+        assert dataset.num_transitions < 200
+        terminal_infos.append(dataset.infos[-1])
+
+    assert all(bool(info["glass_fits_window"]) for info in terminal_infos)
+    assert all(not bool(info["collision"]) for info in terminal_infos)
+    assert all(not bool(info["plane_violation"]) for info in terminal_infos)
+    assert all(float(info["position_error"]) < 0.005 for info in terminal_infos)
+
+
+def test_pickplace_expert_dataset_insert_64_episode_success_rate():
     def make_env():
         return gym.make("FrankaPickAndPlaceWindowInsertSparse-v0")
 
     dataset = collect_pickplace_expert_dataset(
         make_env,
-        num_episodes=9,
-        seed_start=0,
+        num_episodes=64,
+        seed_start=1,
         style="insert",
-        keep_failed_episodes=False,
+        keep_failed_episodes=True,
         stop_on_success=True,
     )
 
-    kept_seeds = {
-        int(info["expert_episode_seed"])
-        for info in dataset.infos
-    }
-    assert np.isclose(dataset.success_rate, 8 / 9)
-    assert 3 not in kept_seeds
-    assert kept_seeds == {0, 1, 2, 4, 5, 6, 7, 8}
-    assert dataset.num_transitions < 8 * 200
-    assert all(bool(info["expert_episode_success"]) for info in dataset.infos)
+    failed_seeds = [
+        seed
+        for seed, success in zip(range(1, 65), dataset.episode_successes)
+        if not success
+    ]
+    assert failed_seeds == []
+    assert np.isclose(dataset.success_rate, 1.0)

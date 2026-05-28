@@ -7,10 +7,10 @@ from gymnasium_robotics.utils import rotations
 from typing import Optional, Any, SupportsFloat
 
 DEFAULT_CAMERA_CONFIG = {
-    "distance": 2.4,
+    "distance": 2.76,
     "azimuth": -1.0,
-    "elevation": -18.0,
-    "lookat": np.array([0.0, 0.5, 0.05]),
+    "elevation": -25.5,
+    "lookat": np.array([0.18, -0.04, 0.185]),
 }
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import sys
 import time
 from dataclasses import dataclass
@@ -35,14 +36,16 @@ Keyboard:
   R: reset camera to the repo default
   N: reset the scene and sample a new window pose
   H: print this help again
+  Hold Left Shift: move faster
+  Hold Left Ctrl: move slower
 
-  , / . : azimuth - / +
-  [ / ] : elevation - / +
-  - / = : zoom out / in
+  Hold , / . : azimuth - / +
+  Hold [ / ] : elevation - / +
+  Hold - / = : zoom out / in
 
-  U / O: lookat x - / +
-  J / L: lookat y - / +
-  I / K: lookat z + / -
+  Hold U / O or Left / Right: lookat x - / +
+  Hold J / L or Down / Up: lookat y - / +
+  Hold I / K or PageUp / PageDown: lookat z + / -
 
 Close the viewer window, press Esc, or press Ctrl+C in the terminal to exit.
 """.strip()
@@ -68,9 +71,19 @@ def default_camera_state() -> CameraState:
 class CameraTunerViewer(WindowViewer):
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, tuner: "InteractiveCameraTuner") -> None:
         self._tuner = tuner
+        self._pressed_keys: set[int] = set()
         super().__init__(model, data)
 
+    def render(self) -> None:
+        self._tuner.update_keyboard_camera_controls()
+        super().render()
+
     def _key_callback(self, window, key: int, scancode, action: int, mods) -> None:
+        if action in (glfw.PRESS, glfw.REPEAT):
+            self._pressed_keys.add(key)
+        elif action == glfw.RELEASE:
+            self._pressed_keys.discard(key)
+
         if action != glfw.RELEASE:
             return
 
@@ -88,44 +101,17 @@ class CameraTunerViewer(WindowViewer):
             self._tuner.reset_camera()
             self._tuner.print_camera_state(self.cam)
             return
-        if key == glfw.KEY_COMMA:
-            self._tuner.adjust_camera(azimuth_delta=-self._tuner.angle_step_deg)
-            return
-        if key == glfw.KEY_PERIOD:
-            self._tuner.adjust_camera(azimuth_delta=self._tuner.angle_step_deg)
-            return
-        if key == glfw.KEY_LEFT_BRACKET:
-            self._tuner.adjust_camera(elevation_delta=-self._tuner.angle_step_deg)
-            return
-        if key == glfw.KEY_RIGHT_BRACKET:
-            self._tuner.adjust_camera(elevation_delta=self._tuner.angle_step_deg)
-            return
-        if key == glfw.KEY_MINUS:
-            self._tuner.adjust_camera(distance_delta=self._tuner.distance_step)
-            return
-        if key == glfw.KEY_EQUAL:
-            self._tuner.adjust_camera(distance_delta=-self._tuner.distance_step)
-            return
-        if key == glfw.KEY_U:
-            self._tuner.adjust_camera(lookat_delta=np.array([-self._tuner.lookat_step, 0.0, 0.0], dtype=np.float64))
-            return
-        if key == glfw.KEY_O:
-            self._tuner.adjust_camera(lookat_delta=np.array([self._tuner.lookat_step, 0.0, 0.0], dtype=np.float64))
-            return
-        if key == glfw.KEY_J:
-            self._tuner.adjust_camera(lookat_delta=np.array([0.0, -self._tuner.lookat_step, 0.0], dtype=np.float64))
-            return
-        if key == glfw.KEY_L:
-            self._tuner.adjust_camera(lookat_delta=np.array([0.0, self._tuner.lookat_step, 0.0], dtype=np.float64))
-            return
-        if key == glfw.KEY_I:
-            self._tuner.adjust_camera(lookat_delta=np.array([0.0, 0.0, self._tuner.lookat_step], dtype=np.float64))
-            return
-        if key == glfw.KEY_K:
-            self._tuner.adjust_camera(lookat_delta=np.array([0.0, 0.0, -self._tuner.lookat_step], dtype=np.float64))
+        if key in self._tuner.continuous_camera_keys:
             return
 
         super()._key_callback(window, key, scancode, action, mods)
+
+    def is_key_pressed(self, key: int) -> bool:
+        if key in self._pressed_keys:
+            return True
+        if self.window is None:
+            return False
+        return glfw.get_key(self.window, key) in (glfw.PRESS, glfw.REPEAT)
 
     def _create_overlay(self) -> None:
         super()._create_overlay()
@@ -133,9 +119,11 @@ class CameraTunerViewer(WindowViewer):
         bottom_right = getattr(mujoco.mjtGridPos, "mjGRID_BOTTOMRIGHT", mujoco.mjtGridPos.mjGRID_BOTTOMLEFT)
 
         self.add_overlay(top_right, "Camera tuner", "[P] print  [R] reset  [N] new scene  [H] help")
-        self.add_overlay(top_right, "Azimuth / Elevation", "[,][.] / [[] []]")
-        self.add_overlay(top_right, "Zoom", "[-] out  [=] in")
-        self.add_overlay(top_right, "Lookat x / y / z", "[U][O] / [J][L] / [I][K]")
+        self.add_overlay(top_right, "Azimuth / Elevation", "hold [,][.] / [[] []]")
+        self.add_overlay(top_right, "Zoom", "hold [-] out  [=] in")
+        self.add_overlay(top_right, "Lookat x / y / z", "hold [U][O] / [J][L] / [I][K]")
+        self.add_overlay(top_right, "Lookat alt", "arrows for x/y  PgUp/PgDn for z")
+        self.add_overlay(top_right, "Speed", "Shift fast  Ctrl slow")
         self.add_overlay(
             bottom_right,
             "Camera",
@@ -144,7 +132,7 @@ class CameraTunerViewer(WindowViewer):
         self.add_overlay(
             bottom_right,
             "Lookat",
-            f"[{float(self.cam.lookat[0]):.3f}, {float(self.cam.lookat[1]):.3f}, {float(self.cam.lookat[2]):.3f}]",
+            self._tuner.format_camera_lookat(self.cam, precision=3),
         )
 
 
@@ -155,10 +143,35 @@ class InteractiveCameraTuner:
         self.default_camera = default_camera_state()
         self.viewer: Optional[CameraTunerViewer] = None
         self.next_seed = seed
+        self._last_keyboard_update_time: Optional[float] = None
 
-        self.angle_step_deg = 2.0
-        self.distance_step = 0.05
-        self.lookat_step = 0.02
+        self.angle_speed_deg = 75.0
+        self.distance_speed = 1.2
+        self.lookat_speed = 0.45
+        self.fast_multiplier = 4.0
+        self.slow_multiplier = 0.25
+        self.continuous_camera_keys = {
+            glfw.KEY_COMMA,
+            glfw.KEY_PERIOD,
+            glfw.KEY_LEFT_BRACKET,
+            glfw.KEY_RIGHT_BRACKET,
+            glfw.KEY_MINUS,
+            glfw.KEY_EQUAL,
+            glfw.KEY_KP_SUBTRACT,
+            glfw.KEY_KP_ADD,
+            glfw.KEY_U,
+            glfw.KEY_O,
+            glfw.KEY_J,
+            glfw.KEY_L,
+            glfw.KEY_I,
+            glfw.KEY_K,
+            glfw.KEY_LEFT,
+            glfw.KEY_RIGHT,
+            glfw.KEY_DOWN,
+            glfw.KEY_UP,
+            glfw.KEY_PAGE_UP,
+            glfw.KEY_PAGE_DOWN,
+        }
 
         self.reset_scene()
 
@@ -179,6 +192,7 @@ class InteractiveCameraTuner:
         if self.viewer is not None:
             self.viewer.model = self.base.model
             self.viewer.data = self.base.data
+            self._last_keyboard_update_time = None
 
     def apply_camera_state(self, cam: mujoco.MjvCamera, state: CameraState) -> None:
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -186,14 +200,14 @@ class InteractiveCameraTuner:
         cam.distance = float(max(0.05, state.distance))
         cam.azimuth = float(state.azimuth)
         cam.elevation = float(state.elevation)
-        cam.lookat[:] = np.asarray(state.lookat, dtype=np.float64)
+        self._camera_lookat_view(cam)[:] = np.asarray(state.lookat, dtype=np.float64)
 
     def capture_camera_state(self, cam: mujoco.MjvCamera) -> CameraState:
         return CameraState(
             distance=float(cam.distance),
             azimuth=float(cam.azimuth),
             elevation=float(cam.elevation),
-            lookat=np.asarray(cam.lookat, dtype=np.float64).copy(),
+            lookat=self._camera_lookat_view(cam).copy(),
         )
 
     def adjust_camera(
@@ -207,11 +221,86 @@ class InteractiveCameraTuner:
         if self.viewer is None:
             return
         cam = self.viewer.cam
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.fixedcamid = -1
         cam.azimuth += float(azimuth_delta)
         cam.elevation += float(elevation_delta)
         cam.distance = float(max(0.05, cam.distance + distance_delta))
         if lookat_delta is not None:
-            cam.lookat[:] = np.asarray(cam.lookat, dtype=np.float64) + np.asarray(lookat_delta, dtype=np.float64)
+            lookat = self._camera_lookat_view(cam)
+            lookat[:] = lookat + np.asarray(lookat_delta, dtype=np.float64)
+
+    def format_camera_lookat(self, cam: mujoco.MjvCamera, precision: int = 6) -> str:
+        return self._format_vec(self._camera_lookat_view(cam), precision=precision)
+
+    def update_keyboard_camera_controls(self) -> None:
+        if self.viewer is None or self.viewer.window is None:
+            self._last_keyboard_update_time = None
+            return
+
+        now = time.monotonic()
+        if self._last_keyboard_update_time is None:
+            self._last_keyboard_update_time = now
+            return
+
+        dt = min(now - self._last_keyboard_update_time, 0.1)
+        self._last_keyboard_update_time = now
+
+        speed_scale = self._keyboard_speed_scale()
+        angle_delta = self.angle_speed_deg * dt * speed_scale
+        distance_delta = self.distance_speed * dt * speed_scale
+        lookat_delta = np.zeros(3, dtype=np.float64)
+        lookat_step = self.lookat_speed * dt * speed_scale
+
+        azimuth_delta = 0.0
+        elevation_delta = 0.0
+        zoom_delta = 0.0
+
+        if self._is_pressed(glfw.KEY_COMMA):
+            azimuth_delta -= angle_delta
+        if self._is_pressed(glfw.KEY_PERIOD):
+            azimuth_delta += angle_delta
+        if self._is_pressed(glfw.KEY_LEFT_BRACKET):
+            elevation_delta -= angle_delta
+        if self._is_pressed(glfw.KEY_RIGHT_BRACKET):
+            elevation_delta += angle_delta
+
+        if self._is_pressed(glfw.KEY_MINUS) or self._is_pressed(glfw.KEY_KP_SUBTRACT):
+            zoom_delta += distance_delta
+        if self._is_pressed(glfw.KEY_EQUAL) or self._is_pressed(glfw.KEY_KP_ADD):
+            zoom_delta -= distance_delta
+
+        if self._is_pressed(glfw.KEY_U) or self._is_pressed(glfw.KEY_LEFT):
+            lookat_delta[0] -= lookat_step
+        if self._is_pressed(glfw.KEY_O) or self._is_pressed(glfw.KEY_RIGHT):
+            lookat_delta[0] += lookat_step
+        if self._is_pressed(glfw.KEY_J) or self._is_pressed(glfw.KEY_DOWN):
+            lookat_delta[1] -= lookat_step
+        if self._is_pressed(glfw.KEY_L) or self._is_pressed(glfw.KEY_UP):
+            lookat_delta[1] += lookat_step
+        if self._is_pressed(glfw.KEY_I) or self._is_pressed(glfw.KEY_PAGE_UP):
+            lookat_delta[2] += lookat_step
+        if self._is_pressed(glfw.KEY_K) or self._is_pressed(glfw.KEY_PAGE_DOWN):
+            lookat_delta[2] -= lookat_step
+
+        if azimuth_delta or elevation_delta or zoom_delta or np.any(lookat_delta):
+            self.adjust_camera(
+                azimuth_delta=azimuth_delta,
+                elevation_delta=elevation_delta,
+                distance_delta=zoom_delta,
+                lookat_delta=lookat_delta,
+            )
+
+    def _keyboard_speed_scale(self) -> float:
+        scale = 1.0
+        if self._is_pressed(glfw.KEY_LEFT_SHIFT) or self._is_pressed(glfw.KEY_RIGHT_SHIFT):
+            scale *= self.fast_multiplier
+        if self._is_pressed(glfw.KEY_LEFT_CONTROL) or self._is_pressed(glfw.KEY_RIGHT_CONTROL):
+            scale *= self.slow_multiplier
+        return scale
+
+    def _is_pressed(self, key: int) -> bool:
+        return self.viewer is not None and self.viewer.is_key_pressed(key)
 
     def reset_camera(self) -> None:
         if self.viewer is None:
@@ -260,9 +349,14 @@ class InteractiveCameraTuner:
             time.sleep(1.0 / 60.0)
 
     @staticmethod
-    def _format_vec(vec: np.ndarray) -> str:
+    def _camera_lookat_view(cam: mujoco.MjvCamera) -> np.ndarray:
+        ptr = int(cam.lookat.__array_interface__["data"][0])
+        return np.ctypeslib.as_array((ctypes.c_double * 3).from_address(ptr))
+
+    @staticmethod
+    def _format_vec(vec: np.ndarray, precision: int = 6) -> str:
         values = np.asarray(vec, dtype=np.float64).reshape(-1)
-        return "[" + ", ".join(f"{value:.6f}" for value in values) + "]"
+        return "[" + ", ".join(f"{value:.{precision}f}" for value in values) + "]"
 
 
 def parse_args() -> argparse.Namespace:
@@ -278,12 +372,33 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Initial reset seed. Use a different value to inspect another sampled window pose.",
     )
+    parser.add_argument(
+        "--angle-speed",
+        type=float,
+        default=75.0,
+        help="Keyboard azimuth/elevation speed in degrees per second.",
+    )
+    parser.add_argument(
+        "--distance-speed",
+        type=float,
+        default=1.2,
+        help="Keyboard zoom speed in MuJoCo distance units per second.",
+    )
+    parser.add_argument(
+        "--lookat-speed",
+        type=float,
+        default=0.45,
+        help="Keyboard lookat speed in MuJoCo world units per second.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     tuner = InteractiveCameraTuner(env_id=args.env, seed=args.seed)
+    tuner.angle_speed_deg = float(args.angle_speed)
+    tuner.distance_speed = float(args.distance_speed)
+    tuner.lookat_speed = float(args.lookat_speed)
     try:
         tuner.run()
     finally:

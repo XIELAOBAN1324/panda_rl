@@ -2,6 +2,7 @@ import os
 
 import numpy as np
 
+from panda_mujoco_gym.envs.insert_reward import compute_insert_dense_reward
 from panda_mujoco_gym.envs.panda_env import FrankaEnv
 
 
@@ -292,12 +293,18 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
             return -np.logical_not(success).astype(np.float32)
 
         if self.is_insertion_task:
-            reward = -position_distance - 0.50 * orientation_error - 0.35 * inplane_error
-            reward += 0.30 * (orientation_alignment >= self.orientation_threshold_cos).astype(np.float32)
-            reward += 0.20 * (inplane_alignment >= self.orientation_threshold_cos).astype(np.float32)
-            reward += 1.00 * success.astype(np.float32)
-            reward -= 2.00 * collision
-            return reward.astype(np.float32)
+            return compute_insert_dense_reward(
+                distances=position_distance,
+                orientation_error=orientation_error,
+                inplane_error=inplane_error,
+                orientation_alignment=orientation_alignment,
+                inplane_alignment=inplane_alignment,
+                glass_fits_window=plate_fits,
+                collision=collision,
+                plane_violation=plane_violation,
+                distance_threshold=self.window_position_threshold,
+                orientation_threshold=self.orientation_threshold_cos,
+            )
 
         reward = -position_distance - 0.35 * orientation_error
         ee_object_distance = float(info.get("ee_object_distance", 0.0))

@@ -2,6 +2,7 @@
 """Record rollout videos from a trained SAC policy checkpoint."""
 
 import argparse
+from collections import Counter
 import json
 import os
 import re
@@ -443,6 +444,54 @@ def _safe_bool(info: Dict[str, Any], key: str, default: bool = False) -> bool:
         return bool(default)
 
 
+def _failure_thresholds(env) -> Dict[str, float]:
+    base = getattr(env, "unwrapped", env)
+    return {
+        "position_threshold": float(getattr(base, "window_position_threshold", getattr(base, "distance_threshold", 0.05))),
+        "orientation_threshold": float(getattr(base, "orientation_threshold_cos", 1.0)),
+        "inplane_threshold": float(getattr(base, "orientation_threshold_cos", 1.0)),
+    }
+
+
+def _episode_failure_reasons(
+    terminal_info: Dict[str, Any],
+    terminal_success: bool,
+    any_success: bool,
+    timed_out: bool,
+    thresholds: Dict[str, float],
+) -> tuple[str, List[str]]:
+    if terminal_success:
+        return "success", []
+
+    reasons: List[str] = []
+    if _safe_bool(terminal_info, "collision", False):
+        reasons.append("collision")
+    if _safe_bool(terminal_info, "plane_violation", False):
+        reasons.append("plane_violation")
+    if not _safe_bool(terminal_info, "glass_fits_window", False):
+        reasons.append("glass_not_fit_window")
+
+    position_error = _safe_float(terminal_info, "position_error")
+    if np.isfinite(position_error) and position_error >= float(thresholds["position_threshold"]):
+        reasons.append("position_error")
+
+    orientation_alignment = _safe_float(terminal_info, "orientation_alignment")
+    if np.isfinite(orientation_alignment) and orientation_alignment < float(thresholds["orientation_threshold"]):
+        reasons.append("orientation_misalignment")
+
+    inplane_alignment = _safe_float(terminal_info, "inplane_alignment")
+    if np.isfinite(inplane_alignment) and inplane_alignment < float(thresholds["inplane_threshold"]):
+        reasons.append("inplane_misalignment")
+
+    if timed_out:
+        reasons.append("timeout")
+    if not reasons:
+        reasons.append("unknown")
+
+    primary = "lost_success" if any_success else reasons[0]
+    return primary, reasons
+
+
 def record_policy_episode(
     env,
     model: SAC,
@@ -465,6 +514,7 @@ def record_policy_episode(
     terminal_info: Dict[str, Any] = {}
     terminal_success = False
     any_success = False
+    first_success_step: Optional[int] = None
     terminated = False
     truncated = False
 
@@ -484,10 +534,13 @@ def record_policy_episode(
         _capture_frame(env, recorder, width=frame_width, height=frame_height)
 
         terminal_success = _safe_bool(terminal_info, "is_success", False)
-        any_success = any_success or terminal_success or _safe_bool(terminal_info, "episode_any_success", False)
+        current_success = terminal_success or _safe_bool(terminal_info, "episode_any_success", False)
+        if current_success and first_success_step is None:
+            first_success_step = step_count
+        any_success = any_success or current_success
         done = bool(terminated or truncated)
 
-        if stop_on_success and any_success:
+        if stop_on_success and current_success:
             for _ in range(max(success_hold_frames, 0)):
                 _capture_frame(env, recorder, width=frame_width, height=frame_height)
             break
@@ -497,6 +550,16 @@ def record_policy_episode(
                 _capture_frame(env, recorder, width=frame_width, height=frame_height)
             break
 
+    thresholds = _failure_thresholds(env)
+    timed_out = bool(truncated or (not terminated and step_count >= max_steps))
+    primary_failure_reason, failure_reasons = _episode_failure_reasons(
+        terminal_info=terminal_info,
+        terminal_success=terminal_success,
+        any_success=any_success,
+        timed_out=timed_out,
+        thresholds=thresholds,
+    )
+
     episode_info = {
         "stage": model_label,
         "model_label": model_label,
@@ -504,15 +567,26 @@ def record_policy_episode(
         "seed": int(seed),
         "reward": float(total_reward),
         "length": int(step_count),
-        "success": bool(any_success),
+        "success": bool(terminal_success),
+        "any_success": bool(any_success),
         "terminal_success": bool(terminal_success),
+        "first_success_step": None if first_success_step is None else int(first_success_step),
+        "lost_success": bool(any_success and not terminal_success),
+        "primary_failure_reason": primary_failure_reason,
+        "failure_reasons": failure_reasons,
         "terminated": bool(terminated),
         "truncated": bool(truncated),
+        "timed_out": bool(timed_out),
         "env_id": str(configured_env_id(env)),
+        "position_threshold": float(thresholds["position_threshold"]),
+        "orientation_threshold": float(thresholds["orientation_threshold"]),
+        "inplane_threshold": float(thresholds["inplane_threshold"]),
         "terminal_collision": _safe_bool(terminal_info, "collision", False),
         "terminal_plane_violation": _safe_bool(terminal_info, "plane_violation", False),
         "terminal_position_error": _safe_float(terminal_info, "position_error"),
         "terminal_orientation_alignment": _safe_float(terminal_info, "orientation_alignment"),
+        "terminal_inplane_alignment": _safe_float(terminal_info, "inplane_alignment"),
+        "terminal_pose_alignment": _safe_float(terminal_info, "pose_alignment"),
         "terminal_glass_fits_window": _safe_bool(terminal_info, "glass_fits_window", False),
     }
     video_path = recorder.end_episode_recording(episode_info)
@@ -540,7 +614,16 @@ def _write_summary(
 ) -> Path:
     rewards = np.asarray([episode["reward"] for episode in episodes], dtype=np.float64)
     successes = np.asarray([episode["success"] for episode in episodes], dtype=np.float64)
+    any_successes = np.asarray([episode.get("any_success", episode["success"]) for episode in episodes], dtype=np.float64)
+    lost_successes = np.asarray([episode.get("lost_success", False) for episode in episodes], dtype=np.float64)
     lengths = np.asarray([episode["length"] for episode in episodes], dtype=np.float64)
+    failure_reason_counts: Counter[str] = Counter()
+    for episode in episodes:
+        if bool(episode.get("success", False)):
+            continue
+        failure_reason_counts.update(str(reason) for reason in episode.get("failure_reasons", ["unknown"]))
+        if bool(episode.get("lost_success", False)):
+            failure_reason_counts.update(["lost_success"])
 
     summary = {
         "model_path": str(model_path),
@@ -550,7 +633,14 @@ def _write_summary(
         "mean_reward": float(np.mean(rewards)) if rewards.size else 0.0,
         "std_reward": float(np.std(rewards)) if rewards.size else 0.0,
         "success_rate": float(np.mean(successes)) if successes.size else 0.0,
+        "terminal_success_rate": float(np.mean(successes)) if successes.size else 0.0,
+        "any_success_rate": float(np.mean(any_successes)) if any_successes.size else 0.0,
+        "lost_success_rate": float(np.mean(lost_successes)) if lost_successes.size else 0.0,
         "mean_length": float(np.mean(lengths)) if lengths.size else 0.0,
+        "failure_reason_counts": dict(failure_reason_counts),
+        "position_threshold": episodes[0].get("position_threshold") if episodes else None,
+        "orientation_threshold": episodes[0].get("orientation_threshold") if episodes else None,
+        "inplane_threshold": episodes[0].get("inplane_threshold") if episodes else None,
         "episodes": episodes,
     }
 
@@ -645,9 +735,11 @@ def record_policy_videos(args: argparse.Namespace) -> Path:
             )
             episodes.append(result)
             status = "SUCCESS" if result["success"] else "FAIL"
+            reason = result.get("primary_failure_reason", "unknown")
             print(
                 f"Episode {episode_idx:03d}: {status}, "
                 f"reward={result['reward']:.3f}, length={result['length']}, "
+                f"any_success={result.get('any_success')}, reason={reason}, "
                 f"video={result.get('video_path')}"
             )
     finally:
@@ -718,8 +810,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="auto", help="SB3 load device: auto/cpu/cuda/cuda:0.")
     parser.add_argument("--stochastic", dest="deterministic", action="store_false", help="Sample stochastic actions.")
     parser.set_defaults(deterministic=True)
+    parser.add_argument("--stop-on-success", dest="stop_on_success", action="store_true")
     parser.add_argument("--no-stop-on-success", dest="stop_on_success", action="store_false")
-    parser.set_defaults(stop_on_success=True)
+    parser.set_defaults(stop_on_success=False)
     parser.add_argument("--initial-frames", type=int, default=3, help="Frames to record before the first action.")
     parser.add_argument("--terminal-hold-frames", type=int, default=5, help="Extra frames after termination.")
     parser.add_argument("--success-hold-frames", type=int, default=15, help="Extra frames after first success.")

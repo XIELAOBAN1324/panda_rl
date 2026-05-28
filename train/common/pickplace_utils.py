@@ -358,6 +358,7 @@ def pickplace_expert_action(
     object_rotation_matrix: np.ndarray | None = None,
     position_scale: float = 0.05,
     rotation_scale: float = 0.20,
+    phase_steps: int = 0,
 ) -> np.ndarray:
     ee_position = np.asarray(observation["observation"][:3], dtype=np.float32)
     object_position = goal_position(observation["achieved_goal"])
@@ -391,9 +392,21 @@ def pickplace_expert_action(
             target_position, gripper_action, object_space_target = targets[phase]
             delta = target_position - (object_position if object_space_target else ee_position)
             pos_action = np.clip(delta / max(float(position_scale), 1e-6), -1.0, 1.0)
+            hold_settle_active = False
             if phase == "hold":
                 lateral_error = float(np.linalg.norm((goal_pos - object_position)[1:3]))
-                if lateral_error > 0.003:
+                if int(phase_steps) >= 20:
+                    hold_settle_active = True
+                    final_target = goal_pos - goal_normal * WINDOW_FINAL_INSERT_OFFSET
+                    final_delta = final_target - object_position
+                    final_action = final_delta / max(float(position_scale), 1e-6)
+                    normal_action = 2.0 * float(np.dot(final_action, goal_normal))
+                    tangential_action = final_action - goal_normal * float(np.dot(final_action, goal_normal))
+                    tangential_action = 2.0 * tangential_action
+                    normal_action = float(np.clip(normal_action, -0.10, 0.10))
+                    tangential_action = np.clip(tangential_action, -0.30, 0.30)
+                    pos_action = np.clip(goal_normal * normal_action + tangential_action, -1.0, 1.0)
+                elif lateral_error > 0.003:
                     pos_action[0] *= 0.25
                     pos_action[1:] = np.clip(pos_action[1:] * 2.5, -1.0, 1.0)
             if phase in {"reorient", "transport"}:
@@ -408,6 +421,8 @@ def pickplace_expert_action(
                     object_rotation_matrix,
                     rotation_scale,
                 )
+                if hold_settle_active and alignment_for_translation > 0.995:
+                    rot_action = np.zeros(3, dtype=np.float32)
             if phase != "reorient":
                 pos_action *= translation_scale_from_alignment(alignment_for_translation)
             components = [pos_action, rot_action]

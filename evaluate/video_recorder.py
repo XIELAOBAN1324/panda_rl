@@ -5,6 +5,7 @@
 import os
 import cv2
 import json
+import re
 import shutil
 import subprocess
 from typing import List, Dict, Optional, Any
@@ -52,14 +53,16 @@ class EpisodeVideoRecorder:
 
         episode_id = int(episode_info.get("episode_id", 0))
         success_str = "SUCCESS" if bool(episode_info.get("success", False)) else "FAIL"
+        failure_reason = self._safe_filename_token(str(episode_info.get("primary_failure_reason", "unknown")))
         reward = float(episode_info.get("reward", 0.0))
 
-        filename = f"ep{episode_id:03d}_{success_str}_reward{reward:.1f}.mp4"
+        reason_suffix = "" if success_str == "SUCCESS" else f"_{failure_reason}"
+        filename = f"ep{episode_id:03d}_{success_str}{reason_suffix}_reward{reward:.1f}.mp4"
         video_path = os.path.join(self.save_dir, filename)
 
         version = 1
         while os.path.exists(video_path) and version < 100:
-            filename = f"ep{episode_id:03d}_{success_str}_reward{reward:.1f}_v{version}.mp4"
+            filename = f"ep{episode_id:03d}_{success_str}{reason_suffix}_reward{reward:.1f}_v{version}.mp4"
             video_path = os.path.join(self.save_dir, filename)
             version += 1
 
@@ -74,6 +77,10 @@ class EpisodeVideoRecorder:
             return video_path
         print(f"⚠️ 视频保存失败: {self.last_error or 'unknown ffmpeg error'}")
         return None
+
+    def _safe_filename_token(self, value: str) -> str:
+        token = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_")
+        return token or "unknown"
 
     def _prepare_frames(self, frames: List[np.ndarray]) -> List[np.ndarray]:
         prepared = []

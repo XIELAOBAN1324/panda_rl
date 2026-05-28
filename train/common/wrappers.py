@@ -8,6 +8,7 @@
 import gymnasium as gym
 import numpy as np
 
+from panda_mujoco_gym.envs.insert_reward import compute_insert_dense_reward
 from train.common.pickplace_utils import (
     goal_alignment,
     goal_orientation_error,
@@ -107,6 +108,7 @@ class PickAndPlaceTaskProgressWrapper(gym.ObservationWrapper):
             ee_forward_axis=ee_forward_axis,
             ee_rotation_matrix=ee_rotation_matrix,
             object_rotation_matrix=object_rotation_matrix,
+            phase_steps=self.phase_steps,
         )
 
     def _augment_observation(self, observation):
@@ -485,26 +487,20 @@ class PickAndPlaceDenseRewardWrapper(gym.Wrapper):
         orientation_threshold = float(getattr(base, "orientation_threshold_cos", np.cos(np.deg2rad(5.0))))
         collision = self._info_array(info, "collision", 0.0, distances.shape)
         plane_violation = self._info_array(info, "plane_violation", 0.0, distances.shape)
-        geometric_success = (
-            (distances < distance_threshold)
-            & (orientation_alignment >= orientation_threshold)
-            & (inplane_alignment >= orientation_threshold)
-            & (collision <= 0.0)
-            & (plane_violation <= 0.0)
-        )
+        glass_fits_window = self._info_array(info, "glass_fits_window", 0.0, distances.shape)
 
-        reward = -distances
-        reward -= 0.5 * orientation_error
-        reward -= 0.35 * inplane_error
-        reward += 0.5 * (
-            (distances < distance_threshold)
-            & (orientation_alignment >= orientation_threshold)
-            & (inplane_alignment >= orientation_threshold)
-        ).astype(np.float32)
-        reward += 1.0 * geometric_success.astype(np.float32)
-        reward -= 2.0 * collision
-        reward -= 1.0 * plane_violation
-        return reward.astype(np.float32)
+        return compute_insert_dense_reward(
+            distances=distances,
+            orientation_error=orientation_error,
+            inplane_error=inplane_error,
+            orientation_alignment=orientation_alignment,
+            inplane_alignment=inplane_alignment,
+            glass_fits_window=glass_fits_window,
+            collision=collision,
+            plane_violation=plane_violation,
+            distance_threshold=distance_threshold,
+            orientation_threshold=orientation_threshold,
+        )
 
     def _compute_window_reward(
         self,

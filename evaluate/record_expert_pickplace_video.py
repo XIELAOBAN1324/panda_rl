@@ -96,6 +96,7 @@ def record_expert_episode(
             ee_forward_axis=ee_forward_axis,
             ee_rotation_matrix=ee_rotation_matrix,
             object_rotation_matrix=object_rotation_matrix,
+            phase_steps=phase_steps,
         )
         next_observation, reward, terminated, truncated, info = env.step(action)
         done = bool(terminated or truncated)
