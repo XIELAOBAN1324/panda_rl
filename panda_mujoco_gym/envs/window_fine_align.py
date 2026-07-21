@@ -110,6 +110,11 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.insert_alignment_violation_hold_steps = int(
             kwargs.pop("insert_alignment_violation_hold_steps", 2)
         )
+        self.insert_success_hold_steps = int(kwargs.pop("insert_success_hold_steps", 3))
+        self.insert_final_verification_max_steps = int(
+            kwargs.pop("insert_final_verification_max_steps", 20)
+        )
+        self.insert_depth_tolerance = float(kwargs.pop("insert_depth_tolerance", 0.0005))
         self.hold_steps = int(kwargs.pop("hold_steps", 40))
         self.hold_position_tolerance = float(kwargs.pop("hold_position_tolerance", 0.003))
         self.hold_angle_tolerance_rad = np.deg2rad(
@@ -125,6 +130,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "normal_gap_correction_sim_steps",
             "insert_action_sim_steps",
             "insert_alignment_violation_hold_steps",
+            "insert_success_hold_steps",
+            "insert_final_verification_max_steps",
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -151,6 +158,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 raise ValueError(f"{name} must be positive")
         if self.normal_gap_correction_threshold < 0.0:
             raise ValueError("normal_gap_correction_threshold must be non-negative")
+        if self.insert_depth_tolerance < 0.0:
+            raise ValueError("insert_depth_tolerance must be non-negative")
         if self.preinsert_normal_offset <= 0.0:
             raise ValueError("preinsert_normal_offset must be positive")
         if self.insert_translation_abort_tolerance < self.translation_tolerance:
@@ -293,6 +302,16 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "insert_alignment_violation_hold_steps": int(
                 self.insert_alignment_violation_hold_steps
             ),
+            "insert_success_hold_steps": int(self.insert_success_hold_steps),
+            "insert_final_alignment_success_count": 0,
+            "insert_final_verification_steps": 0,
+            "insert_final_verification_max_steps": int(
+                self.insert_final_verification_max_steps
+            ),
+            "insert_depth_tolerance": float(self.insert_depth_tolerance),
+            "insert_final_depth_reached": False,
+            "insert_final_command_finished": False,
+            "insert_final_alignment_ok": False,
             "insert_action_sim_steps": int(self.insert_action_sim_steps),
             "insert_translation_abort_tolerance": float(
                 self.insert_translation_abort_tolerance
@@ -311,6 +330,30 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "insert_failure_depth": float("nan"),
             "insert_ee_target_error": float("nan"),
             "insert_depth": 0.0,
+            "insert_final_error_u": float("nan"),
+            "insert_final_error_v": float("nan"),
+            "insert_final_tilt_t1": float("nan"),
+            "insert_final_tilt_t2": float("nan"),
+            "insert_final_yaw": float("nan"),
+            "insert_final_normal_gap": float("nan"),
+            "hold_max_abs_error_u": 0.0,
+            "hold_max_abs_error_v": 0.0,
+            "hold_max_abs_tilt_t1": 0.0,
+            "hold_max_abs_tilt_t2": 0.0,
+            "hold_max_abs_yaw": 0.0,
+            "hold_min_normal_gap": float("nan"),
+            "hold_max_normal_gap": float("nan"),
+            "assembly_verified": False,
+            "assembly_alignment_ok": False,
+            "assembly_depth_ok": False,
+            "assembly_attachment_ok": False,
+            "assembly_collision_ok": False,
+            "final_error_u": float("nan"),
+            "final_error_v": float("nan"),
+            "final_tilt_error_t1": float("nan"),
+            "final_tilt_error_t2": float("nan"),
+            "final_yaw_error": float("nan"),
+            "final_normal_gap": float("nan"),
             "failure_reason": "",
             "failure_category": "",
         }
@@ -1084,71 +1127,25 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         commanded_depth = 0.0
         inserted_steps = 0
         alignment_violation_count = 0
+        final_alignment_success_count = 0
+        final_verification_steps = 0
+        final_verification_started = False
         self._initialize_insert_diagnostics(start_errors)
 
         last_errors = start_errors
         for step_index in range(max(int(max_steps), 1)):
-            errors = self.get_fine_alignment_errors()
-            last_errors = errors
-            self._update_insert_error_diagnostics(errors)
-            self._last_insert_diagnostics["insert_alignment_violation_count"] = int(
-                alignment_violation_count
-            )
-            self._last_insert_diagnostics["insert_depth"] = float(commanded_depth)
-
-            target_center = insert_start_center + commanded_depth * insert_direction
-            immediate_failure = self._insert_immediate_failure_reason(
-                errors,
-                target_center=target_center,
-            )
-            if immediate_failure:
-                failure_reason = immediate_failure
-                self._record_insert_failure(
-                    errors,
-                    failure_reason=failure_reason,
-                    step_index=step_index,
-                    depth=commanded_depth,
+            at_final_command_depth = commanded_depth >= total_depth - 1e-12
+            if not at_final_command_depth:
+                current_gap = float(last_errors["current_normal_gap"])
+                next_gap = max(
+                    target_gap,
+                    min(insert_start_gap, current_gap) - self.insert_step_size,
                 )
-                break
+                next_depth = float(np.clip(insert_start_gap - next_gap, 0.0, total_depth))
+                if next_depth <= commanded_depth:
+                    next_depth = float(min(commanded_depth + self.insert_step_size, total_depth))
+                commanded_depth = next_depth
 
-            alignment_violation_count, alignment_failure = (
-                self._update_insert_alignment_violation_count(
-                    errors,
-                    alignment_violation_count,
-                )
-            )
-            self._last_insert_diagnostics["insert_alignment_violation_count"] = int(
-                alignment_violation_count
-            )
-            if alignment_failure:
-                failure_reason = alignment_failure
-                failure_category = "alignment_degraded_during_insert"
-                self._record_insert_failure(
-                    errors,
-                    failure_reason=failure_reason,
-                    step_index=step_index,
-                    depth=commanded_depth,
-                    failure_category=failure_category,
-                )
-                break
-
-            current_gap = float(errors["current_normal_gap"])
-            if (
-                current_gap <= target_gap + 5e-4
-                and commanded_depth >= total_depth - 1e-12
-            ):
-                success = True
-                failure_reason = ""
-                break
-
-            next_gap = max(
-                target_gap,
-                min(insert_start_gap, current_gap) - self.insert_step_size,
-            )
-            next_depth = float(np.clip(insert_start_gap - next_gap, 0.0, total_depth))
-            if next_depth <= commanded_depth and commanded_depth < total_depth:
-                next_depth = float(min(commanded_depth + self.insert_step_size, total_depth))
-            commanded_depth = next_depth
             # The commanded path has constant t1/t2 coordinates and constant
             # orientation. Feedback merely holds those values against tracking
             # drift; the script introduces no new in-plane/rotation command.
@@ -1160,8 +1157,105 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 center_feedback_gain=1.0,
             )
             inserted_steps += 1
-            self._last_insert_diagnostics["insert_steps"] = int(inserted_steps)
-            self._last_insert_diagnostics["insert_depth"] = float(commanded_depth)
+            errors = self.get_fine_alignment_errors()
+            last_errors = errors
+            self._update_insert_error_diagnostics(errors)
+
+            immediate_failure = self._insert_immediate_failure_reason(
+                errors,
+                target_center=target_center,
+            )
+            alignment_reason = self.get_insert_alignment_failure_reason(errors)
+            alignment_violation_count, alignment_failure = (
+                self._update_insert_alignment_violation_count(
+                    errors,
+                    alignment_violation_count,
+                )
+            )
+            depth_reached = bool(
+                float(errors["current_normal_gap"])
+                <= target_gap + self.insert_depth_tolerance
+            )
+            command_finished = bool(commanded_depth >= total_depth - 1e-12)
+            at_final_depth = bool(depth_reached and command_finished)
+            if at_final_depth:
+                final_verification_started = True
+            if final_verification_started and command_finished:
+                final_verification_steps += 1
+
+            final_alignment_ok = self.insert_alignment_within_abort_tolerance(errors)
+            if at_final_depth and final_alignment_ok:
+                final_alignment_success_count += 1
+            else:
+                final_alignment_success_count = 0
+
+            self._last_insert_diagnostics.update(
+                {
+                    "insert_steps": int(inserted_steps),
+                    "insert_depth": float(commanded_depth),
+                    "insert_alignment_violation_count": int(alignment_violation_count),
+                    "insert_final_alignment_success_count": int(
+                        final_alignment_success_count
+                    ),
+                    "insert_final_verification_steps": int(final_verification_steps),
+                    "insert_final_depth_reached": bool(depth_reached),
+                    "insert_final_command_finished": bool(command_finished),
+                    "insert_final_alignment_ok": bool(final_alignment_ok),
+                    "insert_final_error_u": float(errors["error_u"]),
+                    "insert_final_error_v": float(errors["error_v"]),
+                    "insert_final_tilt_t1": float(errors["tilt_error_t1"]),
+                    "insert_final_tilt_t2": float(errors["tilt_error_t2"]),
+                    "insert_final_yaw": float(errors["yaw_error"]),
+                    "insert_final_normal_gap": float(errors["current_normal_gap"]),
+                }
+            )
+
+            if immediate_failure:
+                failure_reason = immediate_failure
+                self._record_insert_failure(
+                    errors,
+                    failure_reason=failure_reason,
+                    step_index=step_index,
+                    depth=commanded_depth,
+                )
+                break
+
+            if alignment_failure:
+                failure_reason = (
+                    self._final_insert_failure_reason(alignment_failure)
+                    if at_final_depth
+                    else alignment_failure
+                )
+                failure_category = "alignment_degraded_during_insert"
+                self._record_insert_failure(
+                    errors,
+                    failure_reason=failure_reason,
+                    step_index=step_index,
+                    depth=commanded_depth,
+                    failure_category=failure_category,
+                )
+                break
+
+            if final_alignment_success_count >= self.insert_success_hold_steps:
+                success = True
+                failure_reason = ""
+                break
+
+            if final_verification_steps >= self.insert_final_verification_max_steps:
+                failure_reason = (
+                    self._final_insert_failure_reason(alignment_reason)
+                    if alignment_reason
+                    else "insert_final_alignment_not_stable"
+                )
+                failure_category = "alignment_degraded_during_insert"
+                self._record_insert_failure(
+                    errors,
+                    failure_reason=failure_reason,
+                    step_index=step_index,
+                    depth=commanded_depth,
+                    failure_category=failure_category,
+                )
+                break
         else:
             self._record_insert_failure(
                 last_errors,
@@ -1189,7 +1283,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         return success
 
     def run_scripted_hold(self, *, hold_steps: int | None = None) -> bool:
-        """Hold the inserted pose and check attachment, slip, and collision."""
+        """Hold the inserted pose and check relative and absolute assembly state."""
 
         if not self.insert_success or self.stage is not WindowAssemblyStage.INSERT:
             return False
@@ -1198,13 +1292,37 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         start_center = self.get_object_position().copy()
         start_rotation = self.get_object_rotation_matrix().copy()
         failure_reason = ""
+        min_normal_gap = float("inf")
+        max_normal_gap = float("-inf")
         for _ in range(self.hold_steps if hold_steps is None else max(int(hold_steps), 1)):
             self._move_attached_object_pose(start_center, start_rotation, 1)
-            if not self._grasp_weld_is_active():
-                failure_reason = "suction_weld_broken"
+            errors = self.get_fine_alignment_errors()
+            min_normal_gap = min(min_normal_gap, float(errors["current_normal_gap"]))
+            max_normal_gap = max(max_normal_gap, float(errors["current_normal_gap"]))
+            diagnostics = self._last_insert_diagnostics
+            for diagnostic_key, error_key in (
+                ("hold_max_abs_error_u", "error_u"),
+                ("hold_max_abs_error_v", "error_v"),
+                ("hold_max_abs_tilt_t1", "tilt_error_t1"),
+                ("hold_max_abs_tilt_t2", "tilt_error_t2"),
+                ("hold_max_abs_yaw", "yaw_error"),
+            ):
+                diagnostics[diagnostic_key] = max(
+                    float(diagnostics[diagnostic_key]), abs(float(errors[error_key]))
+                )
+            diagnostics["hold_min_normal_gap"] = float(min_normal_gap)
+            diagnostics["hold_max_normal_gap"] = float(max_normal_gap)
+
+            immediate_failure = self._insert_immediate_failure_reason(
+                errors,
+                target_center=start_center,
+            )
+            if immediate_failure:
+                failure_reason = immediate_failure
                 break
-            if self._window_collision_reason():
-                failure_reason = "persistent_window_collision"
+            absolute_failure = self.get_hold_assembly_failure_reason(errors)
+            if absolute_failure:
+                failure_reason = absolute_failure
                 break
             if np.linalg.norm(self.get_object_position() - start_center) > self.hold_position_tolerance:
                 failure_reason = "glass_slipped_during_hold"
@@ -1214,12 +1332,105 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 failure_reason = "glass_rotated_during_hold"
                 break
         self.hold_success = not failure_reason
+        if failure_reason:
+            self._last_insert_diagnostics.update(
+                {
+                    "failure_reason": failure_reason,
+                    "failure_category": "hold_verification_failed",
+                }
+            )
         self.stage_tracker.end(
             self._simulation_step_count,
             success=self.hold_success,
             failure_reason=failure_reason or None,
         )
         return self.hold_success
+
+    @staticmethod
+    def _final_insert_failure_reason(failure_reason: str) -> str:
+        return failure_reason.replace("insert_", "insert_final_", 1)
+
+    def insert_alignment_within_abort_tolerance(
+        self,
+        errors: Mapping[str, Any],
+    ) -> bool:
+        """Check the current actual alignment without applying hysteresis."""
+
+        return not bool(self.get_insert_alignment_failure_reason(errors))
+
+    def get_hold_assembly_failure_reason(self, errors: Mapping[str, Any]) -> str:
+        insert_reason = self.get_insert_alignment_failure_reason(errors)
+        if insert_reason:
+            return {
+                "insert_error_u_exceeded": "hold_error_u_exceeded",
+                "insert_error_v_exceeded": "hold_error_v_exceeded",
+                "insert_tilt_t1_exceeded": "hold_tilt_t1_exceeded",
+                "insert_tilt_t2_exceeded": "hold_tilt_t2_exceeded",
+                "insert_yaw_exceeded": "hold_yaw_exceeded",
+            }[insert_reason]
+        if (
+            float(errors["current_normal_gap"])
+            > -abs(self.insert_final_gap) + self.insert_depth_tolerance
+        ):
+            return "hold_insert_depth_lost"
+        return ""
+
+    def verify_final_assembly(self) -> tuple[bool, dict[str, Any]]:
+        """Re-read actual geometry and verify the final assembled state."""
+
+        errors = self.get_fine_alignment_errors()
+        alignment_ok = self.insert_alignment_within_abort_tolerance(errors)
+        depth_ok = bool(
+            float(errors["current_normal_gap"])
+            <= -abs(self.insert_final_gap) + self.insert_depth_tolerance
+        )
+        attachment_ok = bool(self._grasp_weld_is_active())
+        collision_ok = not bool(self._window_collision_reason())
+        verified = bool(alignment_ok and depth_ok and attachment_ok and collision_ok)
+        diagnostics = {
+            "assembly_verified": verified,
+            "assembly_alignment_ok": bool(alignment_ok),
+            "assembly_depth_ok": bool(depth_ok),
+            "assembly_attachment_ok": bool(attachment_ok),
+            "assembly_collision_ok": bool(collision_ok),
+            "final_error_u": float(errors["error_u"]),
+            "final_error_v": float(errors["error_v"]),
+            "final_tilt_error_t1": float(errors["tilt_error_t1"]),
+            "final_tilt_error_t2": float(errors["tilt_error_t2"]),
+            "final_yaw_error": float(errors["yaw_error"]),
+            "final_normal_gap": float(errors["current_normal_gap"]),
+        }
+        diagnostics["failure_reason"] = self._final_assembly_failure_reason(
+            errors,
+            alignment_ok=alignment_ok,
+            depth_ok=depth_ok,
+            attachment_ok=attachment_ok,
+            collision_ok=collision_ok,
+        )
+        self._last_insert_diagnostics.update(diagnostics)
+        return verified, diagnostics
+
+    def _final_assembly_failure_reason(
+        self,
+        errors: Mapping[str, Any],
+        *,
+        alignment_ok: bool,
+        depth_ok: bool,
+        attachment_ok: bool,
+        collision_ok: bool,
+    ) -> str:
+        if not alignment_ok:
+            insert_reason = self.get_insert_alignment_failure_reason(errors)
+            if insert_reason:
+                return insert_reason.replace("insert_", "final_assembly_", 1)
+            return "final_assembly_alignment_invalid"
+        if not depth_ok:
+            return "final_assembly_depth_invalid"
+        if not attachment_ok:
+            return "final_assembly_attachment_invalid"
+        if not collision_ok:
+            return "final_assembly_collision_invalid"
+        return ""
 
     def _alignment_only_within_tolerance(self, errors: Mapping[str, Any]) -> bool:
         return bool(
@@ -1389,6 +1600,11 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "insert_alignment_violation_hold_steps": int(
                 self.insert_alignment_violation_hold_steps
             ),
+            "insert_success_hold_steps": int(self.insert_success_hold_steps),
+            "insert_final_verification_max_steps": int(
+                self.insert_final_verification_max_steps
+            ),
+            "insert_depth_tolerance": float(self.insert_depth_tolerance),
             "insert_step_size": float(self.insert_step_size),
             "ee_target_error": float(self._last_ee_target_error),
             "corner_distances": np.asarray(errors["corner_distances"], dtype=np.float64).copy(),

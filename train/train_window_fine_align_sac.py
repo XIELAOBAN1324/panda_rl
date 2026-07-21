@@ -66,6 +66,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--insert-tilt-abort-tolerance-deg", type=float, default=0.6)
     parser.add_argument("--insert-yaw-abort-tolerance-deg", type=float, default=0.6)
     parser.add_argument("--insert-alignment-violation-hold-steps", type=int, default=2)
+    parser.add_argument("--insert-success-hold-steps", type=int, default=3)
+    parser.add_argument("--insert-final-verification-max-steps", type=int, default=20)
+    parser.add_argument("--insert-depth-tolerance", type=float, default=0.0005)
     parser.add_argument("--insert-step-size", type=float, default=0.001)
     parser.add_argument("--measurement-noise-translation-std", type=float, default=0.0005)
     parser.add_argument("--measurement-noise-angle-std", type=float, default=0.1)
@@ -118,6 +121,9 @@ def environment_kwargs(
         "insert_tilt_abort_tolerance_deg": args.insert_tilt_abort_tolerance_deg,
         "insert_yaw_abort_tolerance_deg": args.insert_yaw_abort_tolerance_deg,
         "insert_alignment_violation_hold_steps": args.insert_alignment_violation_hold_steps,
+        "insert_success_hold_steps": args.insert_success_hold_steps,
+        "insert_final_verification_max_steps": args.insert_final_verification_max_steps,
+        "insert_depth_tolerance": args.insert_depth_tolerance,
         "insert_step_size": args.insert_step_size,
         "measurement_noise_translation_std": translation_noise,
         "measurement_noise_angle_std_deg": angle_noise,
@@ -170,10 +176,14 @@ def main() -> None:
         or args.normal_gap_correction_sim_steps <= 0
         or args.insert_action_sim_steps <= 0
         or args.insert_alignment_violation_hold_steps <= 0
+        or args.insert_success_hold_steps <= 0
+        or args.insert_final_verification_max_steps <= 0
     ):
         raise ValueError(
             "--fine-action-sim-steps, --normal-gap-correction-sim-steps, "
-            "--insert-action-sim-steps and --insert-alignment-violation-hold-steps must be positive"
+            "--insert-action-sim-steps, --insert-alignment-violation-hold-steps, "
+            "--insert-success-hold-steps and --insert-final-verification-max-steps "
+            "must be positive"
         )
     if args.preinsert_normal_offset <= 0.0:
         raise ValueError("--preinsert-normal-offset must be positive")
@@ -183,6 +193,8 @@ def main() -> None:
         raise ValueError("--max-normal-gap-drift must be positive")
     if args.insert_step_size <= 0.0:
         raise ValueError("--insert-step-size must be positive")
+    if args.insert_depth_tolerance < 0.0:
+        raise ValueError("--insert-depth-tolerance must be non-negative")
     if args.insert_translation_abort_tolerance < args.translation_tolerance:
         raise ValueError(
             "--insert-translation-abort-tolerance must be at least --translation-tolerance"

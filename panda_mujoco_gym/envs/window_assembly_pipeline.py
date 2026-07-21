@@ -166,7 +166,10 @@ class WindowAssemblyPipeline:
         }
         insert_success = False
         hold_success = False
+        assembly_verified = False
+        assembly_diagnostics: dict[str, Any] = {}
         failure_reason = str(info.get("failure_reason", ""))
+        failure_category = ""
         if fine_success and ready_for_insert:
             insert_success = bool(self.base.run_scripted_insert())
             if frame_callback is not None:
@@ -175,6 +178,15 @@ class WindowAssemblyPipeline:
                 hold_success = bool(self.base.run_scripted_hold())
                 if frame_callback is not None:
                     frame_callback(self.env)
+            if hold_success:
+                assembly_verified, assembly_diagnostics = self.base.verify_final_assembly()
+                if not assembly_verified:
+                    failure_reason = str(
+                        assembly_diagnostics.get(
+                            "failure_reason", "final_assembly_verification_failed"
+                        )
+                    )
+                    failure_category = "final_assembly_verification_failed"
             if not insert_success:
                 failure_reason = self._last_failure_reason("insert_failed")
             elif not hold_success:
@@ -206,12 +218,18 @@ class WindowAssemblyPipeline:
             }
 
         action_norms = [float(np.linalg.norm(action)) for action in actions]
+        full_pipeline_success = bool(
+            fine_success and insert_success and hold_success and assembly_verified
+        )
+        if not failure_category:
+            failure_category = str(insert_diagnostics.get("failure_category", ""))
         return {
             "seed": int(seed),
             "stages": stages,
             "stage_records": stage_records,
             "initial_errors": initial_errors,
-            "final_errors": fine_end_errors,
+            "fine_end_errors": fine_end_errors,
+            "final_errors": pipeline_end_errors,
             "pipeline_end_errors": pipeline_end_errors,
             "fine_align_reward": float(np.sum(rewards)) if rewards else 0.0,
             "fine_align_steps": len(actions),
@@ -222,7 +240,8 @@ class WindowAssemblyPipeline:
             "ready_for_insert": ready_for_insert,
             "insert_success": insert_success,
             "hold_success": hold_success,
-            "full_pipeline_success": bool(fine_success and insert_success and hold_success),
+            "assembly_verified": bool(assembly_verified),
+            "full_pipeline_success": full_pipeline_success,
             "insert_steps": int(insert_diagnostics.get("insert_steps", 0)),
             "insert_depth": float(insert_diagnostics.get("insert_depth", 0.0)),
             "insert_start_errors": {
@@ -247,6 +266,75 @@ class WindowAssemblyPipeline:
             "insert_alignment_violation_hold_steps": int(
                 insert_diagnostics.get("insert_alignment_violation_hold_steps", 0)
             ),
+            "insert_success_hold_steps": int(
+                insert_diagnostics.get("insert_success_hold_steps", 0)
+            ),
+            "insert_final_alignment_success_count": int(
+                insert_diagnostics.get("insert_final_alignment_success_count", 0)
+            ),
+            "insert_final_verification_steps": int(
+                insert_diagnostics.get("insert_final_verification_steps", 0)
+            ),
+            "insert_final_verification_max_steps": int(
+                insert_diagnostics.get("insert_final_verification_max_steps", 0)
+            ),
+            "insert_depth_tolerance": float(
+                insert_diagnostics.get("insert_depth_tolerance", float("nan"))
+            ),
+            "insert_final_depth_reached": bool(
+                insert_diagnostics.get("insert_final_depth_reached", False)
+            ),
+            "insert_final_command_finished": bool(
+                insert_diagnostics.get("insert_final_command_finished", False)
+            ),
+            "insert_final_alignment_ok": bool(
+                insert_diagnostics.get("insert_final_alignment_ok", False)
+            ),
+            "insert_final_errors": {
+                key: float(insert_diagnostics.get(key, float("nan")))
+                for key in (
+                    "insert_final_error_u",
+                    "insert_final_error_v",
+                    "insert_final_tilt_t1",
+                    "insert_final_tilt_t2",
+                    "insert_final_yaw",
+                    "insert_final_normal_gap",
+                )
+            },
+            "hold_steps": int(stages[WindowAssemblyStage.HOLD.value]["steps"]),
+            "hold_diagnostics": {
+                key: float(insert_diagnostics.get(key, float("nan")))
+                for key in (
+                    "hold_max_abs_error_u",
+                    "hold_max_abs_error_v",
+                    "hold_max_abs_tilt_t1",
+                    "hold_max_abs_tilt_t2",
+                    "hold_max_abs_yaw",
+                    "hold_min_normal_gap",
+                    "hold_max_normal_gap",
+                )
+            },
+            "assembly_alignment_ok": bool(
+                insert_diagnostics.get("assembly_alignment_ok", False)
+            ),
+            "assembly_depth_ok": bool(insert_diagnostics.get("assembly_depth_ok", False)),
+            "assembly_attachment_ok": bool(
+                insert_diagnostics.get("assembly_attachment_ok", False)
+            ),
+            "assembly_collision_ok": bool(
+                insert_diagnostics.get("assembly_collision_ok", False)
+            ),
+            "assembly_final_errors": {
+                key: float(insert_diagnostics.get(key, float("nan")))
+                for key in (
+                    "final_error_u",
+                    "final_error_v",
+                    "final_tilt_error_t1",
+                    "final_tilt_error_t2",
+                    "final_yaw_error",
+                    "final_normal_gap",
+                )
+            },
             "insert_action_sim_steps": int(
                 insert_diagnostics.get("insert_action_sim_steps", 0)
             ),
@@ -262,10 +350,10 @@ class WindowAssemblyPipeline:
             "insert_ee_target_error": float(
                 insert_diagnostics.get("insert_ee_target_error", float("nan"))
             ),
-            "failure_category": str(insert_diagnostics.get("failure_category", "")),
+            "failure_category": failure_category,
             "terminated": bool(terminated),
             "truncated": bool(truncated),
-            "failure_reason": "" if hold_success else (failure_reason or "pipeline_incomplete"),
+            "failure_reason": "" if full_pipeline_success else (failure_reason or "pipeline_incomplete"),
             "stage": str(self.base.stage.value),
         }
 

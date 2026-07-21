@@ -400,6 +400,7 @@ def _insert_error_dict(**overrides):
         "normal_gap_error": 0.0,
         "current_normal_gap": 0.08,
         "glass_center_world": np.array([0.0, 0.0, 0.2], dtype=np.float64),
+        "frame_normal_world": np.array([0.0, 0.0, 1.0], dtype=np.float64),
     }
     errors.update(overrides)
     return errors
@@ -536,5 +537,222 @@ def test_scripted_insert_uses_configured_substeps_feedback_and_monotonic_gap(mon
         assert diagnostics["insert_action_sim_steps"] == 5
         assert diagnostics["insert_steps"] == len(call_steps)
         assert diagnostics["failure_reason"] == ""
+    finally:
+        env.close()
+
+
+def _mock_insert_episode(base, monkeypatch, post_move_errors):
+    base.stage_tracker.end(base._simulation_step_count, success=True)
+    base.ready_for_insert = True
+    base._episode_done = True
+    target_gap = -abs(base.insert_final_gap)
+    start = _insert_error_dict(current_normal_gap=target_gap)
+    sequence = iter([start, *post_move_errors])
+    last = post_move_errors[-1] if post_move_errors else start
+    monkeypatch.setattr(
+        base,
+        "get_fine_alignment_errors",
+        lambda: next(sequence, last),
+    )
+    monkeypatch.setattr(base, "_move_attached_object_pose", lambda *args, **kwargs: None)
+
+
+def test_final_depth_first_violation_cannot_succeed(monkeypatch):
+    env = gym.make(ENV_ID, insert_success_hold_steps=3, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=1)
+        _mock_insert_episode(
+            base,
+            monkeypatch,
+            [_insert_error_dict(current_normal_gap=-0.005, error_v=0.003)],
+        )
+        assert not base.run_scripted_insert(max_steps=1)
+        assert base.get_last_insert_diagnostics()["insert_final_alignment_success_count"] == 0
+    finally:
+        env.close()
+
+
+def test_final_depth_two_consecutive_violations_fail_with_final_reason(monkeypatch):
+    env = gym.make(ENV_ID, insert_alignment_violation_hold_steps=2, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=2)
+        bad = _insert_error_dict(current_normal_gap=-0.005, error_u=0.003)
+        _mock_insert_episode(base, monkeypatch, [bad, bad])
+        assert not base.run_scripted_insert(max_steps=2)
+        assert (
+            base.get_last_insert_diagnostics()["failure_reason"]
+            == "insert_final_error_u_exceeded"
+        )
+    finally:
+        env.close()
+
+
+def test_final_insert_one_valid_frame_cannot_succeed(monkeypatch):
+    env = gym.make(ENV_ID, insert_success_hold_steps=3, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=3)
+        good = _insert_error_dict(current_normal_gap=-0.005)
+        _mock_insert_episode(base, monkeypatch, [good])
+        assert not base.run_scripted_insert(max_steps=1)
+    finally:
+        env.close()
+
+
+def test_final_insert_success_requires_three_consecutive_valid_frames(monkeypatch):
+    env = gym.make(ENV_ID, insert_success_hold_steps=3, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=3)
+        good = _insert_error_dict(current_normal_gap=-0.005)
+        _mock_insert_episode(base, monkeypatch, [good, good, good])
+        assert base.run_scripted_insert(max_steps=3)
+        diagnostics = base.get_last_insert_diagnostics()
+        assert diagnostics["insert_final_alignment_success_count"] == 3
+        assert diagnostics["insert_final_verification_steps"] == 3
+    finally:
+        env.close()
+
+
+def test_final_insert_valid_count_resets_on_violation(monkeypatch):
+    env = gym.make(
+        ENV_ID,
+        insert_success_hold_steps=3,
+        insert_alignment_violation_hold_steps=3,
+        **NO_NOISE,
+    )
+    try:
+        base = env.unwrapped
+        env.reset(seed=4)
+        good = _insert_error_dict(current_normal_gap=-0.005)
+        bad = _insert_error_dict(current_normal_gap=-0.005, error_v=0.003)
+        _mock_insert_episode(base, monkeypatch, [good, good, bad, good, good])
+        assert not base.run_scripted_insert(max_steps=5)
+        assert base.get_last_insert_diagnostics()["insert_final_alignment_success_count"] == 2
+    finally:
+        env.close()
+
+
+def _mock_hold_episode(base, monkeypatch, errors):
+    base.stage_tracker.end(base._simulation_step_count, success=True)
+    base.stage_tracker.begin(base.stage.__class__.INSERT, base._simulation_step_count)
+    base.stage_tracker.end(base._simulation_step_count, success=True)
+    base.stage = base.stage.__class__.INSERT
+    base.insert_success = True
+    monkeypatch.setattr(base, "_move_attached_object_pose", lambda *args, **kwargs: None)
+    monkeypatch.setattr(base, "get_fine_alignment_errors", lambda: errors)
+
+
+def test_hold_rejects_stable_but_absolutely_misaligned_glass(monkeypatch):
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=5)
+        errors = _insert_error_dict(current_normal_gap=-0.005, error_v=0.0032)
+        _mock_hold_episode(base, monkeypatch, errors)
+        assert not base.run_scripted_hold(hold_steps=2)
+        assert base.stage_tracker.records[-1].failure_reason == "hold_error_v_exceeded"
+    finally:
+        env.close()
+
+
+def test_hold_accepts_relative_stability_and_valid_absolute_geometry(monkeypatch):
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=6)
+        errors = _insert_error_dict(current_normal_gap=-0.005, error_u=0.001)
+        _mock_hold_episode(base, monkeypatch, errors)
+        assert base.run_scripted_hold(hold_steps=2)
+        diagnostics = base.get_last_insert_diagnostics()
+        assert diagnostics["hold_max_abs_error_u"] == 0.001
+        assert diagnostics["hold_min_normal_gap"] == -0.005
+    finally:
+        env.close()
+
+
+def test_final_assembly_verification_rejects_alignment_error(monkeypatch):
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=7)
+        monkeypatch.setattr(
+            base,
+            "get_fine_alignment_errors",
+            lambda: _insert_error_dict(current_normal_gap=-0.005, error_u=0.0028),
+        )
+        verified, diagnostics = base.verify_final_assembly()
+        assert not verified
+        assert diagnostics["failure_reason"] == "final_assembly_error_u_exceeded"
+    finally:
+        env.close()
+
+
+def test_final_assembly_verification_rejects_insufficient_depth(monkeypatch):
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=7)
+        monkeypatch.setattr(
+            base,
+            "get_fine_alignment_errors",
+            lambda: _insert_error_dict(current_normal_gap=0.0),
+        )
+        verified, diagnostics = base.verify_final_assembly()
+        assert not verified
+        assert diagnostics["failure_reason"] == "final_assembly_depth_invalid"
+    finally:
+        env.close()
+
+
+def test_final_assembly_verification_accepts_valid_geometry(monkeypatch):
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=7)
+        monkeypatch.setattr(
+            base,
+            "get_fine_alignment_errors",
+            lambda: _insert_error_dict(current_normal_gap=-0.005),
+        )
+        verified, diagnostics = base.verify_final_assembly()
+        assert verified
+        assert diagnostics["failure_reason"] == ""
+    finally:
+        env.close()
+
+
+def test_insert_hysteresis_recovers_from_one_violation(monkeypatch):
+    env = gym.make(ENV_ID, insert_alignment_violation_hold_steps=2, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=8)
+        good = _insert_error_dict(current_normal_gap=-0.005)
+        bad = _insert_error_dict(current_normal_gap=-0.005, error_u=0.0026)
+        _mock_insert_episode(base, monkeypatch, [bad, good, good, good])
+        assert base.run_scripted_insert(max_steps=4)
+    finally:
+        env.close()
+
+
+def test_illegal_collision_fails_insert_immediately(monkeypatch):
+    env = gym.make(ENV_ID, insert_alignment_violation_hold_steps=2, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        env.reset(seed=8)
+        good = _insert_error_dict(current_normal_gap=-0.005)
+        _mock_insert_episode(base, monkeypatch, [good])
+        monkeypatch.setattr(
+            base,
+            "_window_collision_reason",
+            lambda: "glass_window_illegal_collision",
+        )
+        assert not base.run_scripted_insert(max_steps=1)
+        assert (
+            base.get_last_insert_diagnostics()["failure_reason"]
+            == "glass_window_illegal_collision"
+        )
     finally:
         env.close()

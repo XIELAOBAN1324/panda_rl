@@ -24,6 +24,14 @@ from panda_mujoco_gym.envs.window_assembly_pipeline import WindowAssemblyPipelin
 
 ENV_ID = "FrankaWindowFineAlignDense-v0"
 
+TRACKED_FAILURE_REASONS = (
+    "insert_final_error_u_exceeded",
+    "insert_final_error_v_exceeded",
+    "insert_final_alignment_not_stable",
+    "hold_error_u_exceeded",
+    "hold_error_v_exceeded",
+)
+
 ENV_ARG_DEFAULTS = {
     "measurement_noise_translation_std": 0.0,
     "measurement_noise_angle_std": 0.0,
@@ -37,6 +45,9 @@ ENV_ARG_DEFAULTS = {
     "insert_tilt_abort_tolerance_deg": 0.6,
     "insert_yaw_abort_tolerance_deg": 0.6,
     "insert_alignment_violation_hold_steps": 2,
+    "insert_success_hold_steps": 3,
+    "insert_final_verification_max_steps": 20,
+    "insert_depth_tolerance": 0.0005,
     "insert_step_size": 0.001,
 }
 
@@ -53,6 +64,9 @@ ENV_ARG_TO_KWARG = {
     "insert_tilt_abort_tolerance_deg": "insert_tilt_abort_tolerance_deg",
     "insert_yaw_abort_tolerance_deg": "insert_yaw_abort_tolerance_deg",
     "insert_alignment_violation_hold_steps": "insert_alignment_violation_hold_steps",
+    "insert_success_hold_steps": "insert_success_hold_steps",
+    "insert_final_verification_max_steps": "insert_final_verification_max_steps",
+    "insert_depth_tolerance": "insert_depth_tolerance",
     "insert_step_size": "insert_step_size",
 }
 
@@ -69,6 +83,9 @@ ENV_ARG_FLAGS = {
     "insert_tilt_abort_tolerance_deg": "--insert-tilt-abort-tolerance-deg",
     "insert_yaw_abort_tolerance_deg": "--insert-yaw-abort-tolerance-deg",
     "insert_alignment_violation_hold_steps": "--insert-alignment-violation-hold-steps",
+    "insert_success_hold_steps": "--insert-success-hold-steps",
+    "insert_final_verification_max_steps": "--insert-final-verification-max-steps",
+    "insert_depth_tolerance": "--insert-depth-tolerance",
     "insert_step_size": "--insert-step-size",
 }
 
@@ -96,6 +113,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--insert-tilt-abort-tolerance-deg", type=float, default=0.6)
     parser.add_argument("--insert-yaw-abort-tolerance-deg", type=float, default=0.6)
     parser.add_argument("--insert-alignment-violation-hold-steps", type=int, default=2)
+    parser.add_argument("--insert-success-hold-steps", type=int, default=3)
+    parser.add_argument("--insert-final-verification-max-steps", type=int, default=20)
+    parser.add_argument("--insert-depth-tolerance", type=float, default=0.0005)
     parser.add_argument("--insert-step-size", type=float, default=0.001)
     return parser.parse_args()
 
@@ -166,17 +186,18 @@ def _values_differ(first: Any, second: Any) -> bool:
         return first != second
 
 
-def environment_kwargs(
-    args: argparse.Namespace,
+def build_environment_kwargs(
+    model_path: str,
+    cli_values: dict[str, Any],
+    provided_flags: set[str],
 ) -> tuple[dict[str, Any], Path | None, dict[str, tuple[Any, Any]]]:
-    env_kwargs, config_path = load_training_environment_kwargs(args.model)
+    env_kwargs, config_path = load_training_environment_kwargs(model_path)
     loaded_kwargs = dict(env_kwargs)
-    provided = _provided_flags(sys.argv[1:])
     explicit_overrides: dict[str, tuple[Any, Any]] = {}
     for arg_name, default_value in ENV_ARG_DEFAULTS.items():
         kwarg_name = ENV_ARG_TO_KWARG[arg_name]
-        cli_value = getattr(args, arg_name, default_value)
-        if ENV_ARG_FLAGS[arg_name] in provided:
+        cli_value = cli_values.get(arg_name, default_value)
+        if ENV_ARG_FLAGS[arg_name] in provided_flags:
             if kwarg_name in loaded_kwargs and _values_differ(
                 loaded_kwargs[kwarg_name],
                 cli_value,
@@ -188,6 +209,16 @@ def environment_kwargs(
     return env_kwargs, config_path, explicit_overrides
 
 
+def environment_kwargs(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], Path | None, dict[str, tuple[Any, Any]]]:
+    return build_environment_kwargs(
+        args.model,
+        vars(args),
+        _provided_flags(sys.argv[1:]),
+    )
+
+
 def validate_environment_kwargs(env_kwargs: dict[str, Any]) -> None:
     if int(env_kwargs.get("fine_action_sim_steps", 4)) <= 0:
         raise ValueError("fine_action_sim_steps must be positive")
@@ -197,6 +228,10 @@ def validate_environment_kwargs(env_kwargs: dict[str, Any]) -> None:
         raise ValueError("insert_action_sim_steps must be positive")
     if int(env_kwargs.get("insert_alignment_violation_hold_steps", 2)) <= 0:
         raise ValueError("insert_alignment_violation_hold_steps must be positive")
+    if int(env_kwargs.get("insert_success_hold_steps", 3)) <= 0:
+        raise ValueError("insert_success_hold_steps must be positive")
+    if int(env_kwargs.get("insert_final_verification_max_steps", 20)) <= 0:
+        raise ValueError("insert_final_verification_max_steps must be positive")
     if float(env_kwargs.get("preinsert_normal_offset", 0.08)) <= 0.0:
         raise ValueError("preinsert_normal_offset must be positive")
     if float(env_kwargs.get("normal_gap_correction_threshold", 0.0005)) < 0.0:
@@ -205,6 +240,8 @@ def validate_environment_kwargs(env_kwargs: dict[str, Any]) -> None:
         raise ValueError("max_normal_gap_drift must be positive")
     if float(env_kwargs.get("insert_step_size", 0.001)) <= 0.0:
         raise ValueError("insert_step_size must be positive")
+    if float(env_kwargs.get("insert_depth_tolerance", 0.0005)) < 0.0:
+        raise ValueError("insert_depth_tolerance must be non-negative")
     translation_tolerance = float(env_kwargs.get("translation_tolerance", 0.002))
     tilt_tolerance_deg = float(env_kwargs.get("tilt_tolerance_deg", 0.5))
     yaw_tolerance_deg = float(env_kwargs.get("yaw_tolerance_deg", 0.5))
@@ -234,6 +271,9 @@ def print_effective_environment_configuration(
         "insert_tilt_abort_tolerance_deg",
         "insert_yaw_abort_tolerance_deg",
         "insert_alignment_violation_hold_steps",
+        "insert_success_hold_steps",
+        "insert_final_verification_max_steps",
+        "insert_depth_tolerance",
         "insert_step_size",
     )
     if explicit_overrides:
@@ -257,22 +297,25 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         for result in results
         if not result["full_pipeline_success"]
     )
+    for reason in TRACKED_FAILURE_REASONS:
+        failures.setdefault(reason, 0)
+    failure_categories.setdefault("final_assembly_verification_failed", 0)
     final_translation = [
-        float(np.hypot(result["final_errors"]["error_u"], result["final_errors"]["error_v"]))
+        float(np.hypot(result["pipeline_end_errors"]["error_u"], result["pipeline_end_errors"]["error_v"]))
         for result in results
     ]
     final_tilt = [
         float(
             np.hypot(
-                result["final_errors"]["tilt_error_t1"],
-                result["final_errors"]["tilt_error_t2"],
+                result["pipeline_end_errors"]["tilt_error_t1"],
+                result["pipeline_end_errors"]["tilt_error_t2"],
             )
         )
         for result in results
     ]
-    final_yaw = [abs(float(result["final_errors"]["yaw_error"])) for result in results]
+    final_yaw = [abs(float(result["pipeline_end_errors"]["yaw_error"])) for result in results]
     final_normal_gap_error = [
-        abs(float(result["final_errors"]["normal_gap_error"]))
+        abs(float(result["pipeline_end_errors"]["normal_gap_error"]))
         for result in results
     ]
     return {
@@ -281,6 +324,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "full_pipeline_success_rate": sum(r["full_pipeline_success"] for r in results) / count,
         "insert_success_rate": sum(r["insert_success"] for r in results) / count,
         "hold_success_rate": sum(r["hold_success"] for r in results) / count,
+        "assembly_verified_rate": sum(r["assembly_verified"] for r in results) / count,
         "mean_fine_align_steps": float(np.mean([r["fine_align_steps"] for r in results])) if results else 0.0,
         "mean_final_translation_error_m": float(np.mean(final_translation)) if results else 0.0,
         "mean_final_tilt_error_rad": float(np.mean(final_tilt)) if results else 0.0,
@@ -301,10 +345,14 @@ def main() -> None:
         or args.normal_gap_correction_sim_steps <= 0
         or args.insert_action_sim_steps <= 0
         or args.insert_alignment_violation_hold_steps <= 0
+        or args.insert_success_hold_steps <= 0
+        or args.insert_final_verification_max_steps <= 0
     ):
         raise ValueError(
             "--fine-action-sim-steps, --normal-gap-correction-sim-steps, "
-            "--insert-action-sim-steps and --insert-alignment-violation-hold-steps must be positive"
+            "--insert-action-sim-steps, --insert-alignment-violation-hold-steps, "
+            "--insert-success-hold-steps and --insert-final-verification-max-steps "
+            "must be positive"
         )
     if args.preinsert_normal_offset <= 0.0:
         raise ValueError("--preinsert-normal-offset must be positive")
@@ -314,6 +362,8 @@ def main() -> None:
         raise ValueError("--max-normal-gap-drift must be positive")
     if args.insert_step_size <= 0.0:
         raise ValueError("--insert-step-size must be positive")
+    if args.insert_depth_tolerance < 0.0:
+        raise ValueError("--insert-depth-tolerance must be non-negative")
     output_dir = Path(
         args.output_dir
         or Path("outputs")
@@ -363,11 +413,15 @@ def main() -> None:
             print(
                 f"episode={episode_index} fine={result['fine_align_success']} "
                 f"insert={result['insert_success']} hold={result['hold_success']} "
+                f"assembly_verified={result['assembly_verified']} "
                 f"full={result['full_pipeline_success']} "
                 f"fine_steps={result['fine_align_steps']} insert_steps={result['insert_steps']} "
+                f"hold_steps={result['hold_steps']} "
+                f"insert_final_verification_steps={result['insert_final_verification_steps']} "
                 f"stage={result['stage']} "
                 f"start_errors={insert_start_errors} max_errors={insert_max_errors} "
                 f"insert_depth={result['insert_depth']:.4f} "
+                f"final_errors={result['final_errors']} "
                 f"failure={result['failure_reason'] or 'none'} "
                 f"category={result['failure_category'] or 'none'}"
             )

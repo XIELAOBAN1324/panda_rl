@@ -90,6 +90,9 @@ def test_new_training_entry_has_no_legacy_expert_stack_calls():
         "--insert-tilt-abort-tolerance-deg",
         "--insert-yaw-abort-tolerance-deg",
         "--insert-alignment-violation-hold-steps",
+        "--insert-success-hold-steps",
+        "--insert-final-verification-max-steps",
+        "--insert-depth-tolerance",
         "--insert-step-size",
     ):
         assert flag in source
@@ -147,5 +150,106 @@ def test_evaluation_restores_training_config_and_cli_override_wins(tmp_path, mon
     assert env_kwargs["preinsert_normal_offset"] == 0.08
     assert env_kwargs["insert_action_sim_steps"] == 1
     assert env_kwargs["insert_translation_abort_tolerance"] == 0.003
+    assert env_kwargs["insert_success_hold_steps"] == 3
+    assert env_kwargs["insert_final_verification_max_steps"] == 20
+    assert env_kwargs["insert_depth_tolerance"] == 0.0005
     assert env_kwargs["insert_step_size"] == 0.001
     assert overrides == {"preinsert_normal_offset": (0.20, 0.08)}
+
+
+class _OneStepPolicy:
+    def predict(self, observation, deterministic=True):
+        del observation, deterministic
+        return np.zeros(5, dtype=np.float32), None
+
+
+class _EmptyStageTracker:
+    records = []
+
+    def as_dicts(self):
+        return []
+
+
+class _PipelineVerificationEnv:
+    def __init__(self, *, verified, failure_reason=""):
+        self.unwrapped = self
+        self.stage_tracker = _EmptyStageTracker()
+        self.stage = SimpleNamespace(value="hold")
+        self._verified = bool(verified)
+        self._failure_reason = failure_reason
+
+    @staticmethod
+    def _errors(**overrides):
+        values = {
+            "error_u": 0.0,
+            "error_v": 0.0,
+            "tilt_error_t1": 0.0,
+            "tilt_error_t2": 0.0,
+            "yaw_error": 0.0,
+            "normal_gap_error": 0.0,
+            "current_normal_gap": -0.005,
+        }
+        values.update(overrides)
+        return values
+
+    def reset(self, seed):
+        del seed
+        return np.zeros(11, dtype=np.float32), self._errors()
+
+    def step(self, action):
+        del action
+        info = self._errors(fine_align_success=True, ready_for_insert=True)
+        return np.zeros(11, dtype=np.float32), 0.0, True, False, info
+
+    def get_fine_alignment_errors(self):
+        return self._errors()
+
+    def run_scripted_insert(self):
+        return True
+
+    def run_scripted_hold(self):
+        return True
+
+    def verify_final_assembly(self):
+        return self._verified, {
+            "assembly_verified": self._verified,
+            "failure_reason": self._failure_reason,
+        }
+
+    def get_last_insert_diagnostics(self):
+        return {
+            "assembly_verified": self._verified,
+            "assembly_alignment_ok": self._verified,
+            "assembly_depth_ok": self._verified,
+            "assembly_attachment_ok": True,
+            "assembly_collision_ok": True,
+            "final_error_u": 0.0028 if not self._verified else 0.0,
+            "final_error_v": 0.0,
+            "final_tilt_error_t1": 0.0,
+            "final_tilt_error_t2": 0.0,
+            "final_yaw_error": 0.0,
+            "final_normal_gap": -0.005,
+        }
+
+
+def test_full_pipeline_requires_final_assembly_verification():
+    env = _PipelineVerificationEnv(
+        verified=False,
+        failure_reason="final_assembly_error_u_exceeded",
+    )
+    result = WindowAssemblyPipeline(env).run_episode(_OneStepPolicy(), seed=0)
+    assert result["fine_align_success"]
+    assert result["insert_success"]
+    assert result["hold_success"]
+    assert not result["assembly_verified"]
+    assert not result["full_pipeline_success"]
+    assert result["failure_reason"] == "final_assembly_error_u_exceeded"
+    assert result["failure_category"] == "final_assembly_verification_failed"
+
+
+def test_full_pipeline_succeeds_when_final_assembly_is_verified():
+    env = _PipelineVerificationEnv(verified=True)
+    result = WindowAssemblyPipeline(env).run_episode(_OneStepPolicy(), seed=0)
+    assert result["assembly_verified"]
+    assert result["full_pipeline_success"]
+    assert result["failure_reason"] == ""
