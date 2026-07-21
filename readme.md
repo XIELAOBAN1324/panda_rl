@@ -36,3 +36,11 @@ MUJOCO_GL=egl \
   --record-video \
   --output-dir outputs/window_assembly_visualization/model1500
 ```
+
+```bash
+MUJOCO_GL=egl \
+python capture_stage_snapshots.py \
+  --model outputs/window_fine_align/sac-20260721-205122-seed0/models/checkpoints/window_fine_align_sac_150000_steps.zip \
+  --seed 0 \
+  --output-dir outputs/stage_snapshots_seed0
+```

@@ -13,11 +13,18 @@ from typing import Optional, Any, SupportsFloat
 #     "lookat": np.array([0.18, -0.04, 0.185]),
 # }
 
+# DEFAULT_CAMERA_CONFIG = {
+#     "distance": 2.880000,
+#     "azimuth": -226.000000,
+#     "elevation": -18.000000,
+#     "lookat": np.array([-0.000000, -0.130000, 0.230000], dtype=np.float64),
+# }
+
 DEFAULT_CAMERA_CONFIG = {
     "distance": 2.880000,
-    "azimuth": -226.000000,
+    "azimuth": -263.500000,
     "elevation": -18.000000,
-    "lookat": np.array([-0.000000, -0.130000, 0.230000], dtype=np.float64),
+    "lookat": np.array([0.000000, -0.130000, 0.230000], dtype=np.float64),
 }
 
 class FrankaEnv(MujocoRobotEnv):
