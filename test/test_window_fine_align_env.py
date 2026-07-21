@@ -73,6 +73,45 @@ def test_reset_spaces_seeded_coarse_state_and_no_normal_action():
         env.close()
 
 
+def test_pipeline_render_callback_does_not_overwrite_seeded_window_pose():
+    baseline_env = gym.make(ENV_ID, **NO_NOISE)
+    callback_env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        baseline = baseline_env.unwrapped
+        callback = callback_env.unwrapped
+
+        # Seed the callback environment with a different previous goal.  This
+        # reproduces video collection, where render callbacks fire from inside
+        # the next reset before RobotEnv samples that reset's new goal.
+        callback_env.reset(seed=0)
+        callback.pipeline_frame_callback = callback._render_callback
+
+        expected_centers = []
+        rendered_centers = []
+        for seed in (1, 2, 3):
+            baseline_env.reset(seed=seed)
+            callback_env.reset(seed=seed)
+
+            expected_center = baseline.get_window_center()
+            rendered_center = callback.get_window_center()
+            actual_center = callback.data.xpos[callback.window_body_id].copy()
+            cached_center, _ = callback._current_fine_frame_pose()
+
+            expected_centers.append(expected_center)
+            rendered_centers.append(rendered_center)
+            assert np.allclose(rendered_center, expected_center, atol=1e-12)
+            assert np.allclose(actual_center, expected_center, atol=1e-12)
+            assert np.allclose(cached_center, expected_center, atol=1e-12)
+            assert np.allclose(callback.goal[:3], expected_center, atol=1e-12)
+
+        assert not np.allclose(expected_centers[0], expected_centers[1])
+        assert not np.allclose(expected_centers[1], expected_centers[2])
+        assert np.allclose(rendered_centers, expected_centers, atol=1e-12)
+    finally:
+        baseline_env.close()
+        callback_env.close()
+
+
 def test_step_keeps_suction_reports_reward_and_never_auto_inserts():
     env = gym.make(ENV_ID, **NO_NOISE)
     try:

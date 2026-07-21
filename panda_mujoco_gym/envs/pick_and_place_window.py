@@ -381,12 +381,12 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
         return np.float32(success)
 
     def _render_callback(self) -> None:
-        if self.goal.shape == (6,):
-            self.window_center = self._window_center_from_goal(self.goal)
-            self.window_safe_goal = self.goal[:3].copy()
-        self.model.body_pos[self.window_body_id] = self.window_center
+        # Rendering can happen while ``_reset_sim`` is still running (the
+        # assembly pipeline records the scripted reset stages).  At that point
+        # RobotEnv has not sampled the new goal yet, so synchronizing the
+        # window pose from ``self.goal`` would restore the previous episode's
+        # window and make rendering change the simulation state.
         self._set_target_visibility()
-        self._mujoco.mj_forward(self.model, self.data)
 
     def _reset_sim(self) -> bool:
         self.data.time = self.initial_time
