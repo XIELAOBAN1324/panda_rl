@@ -24,6 +24,36 @@ from panda_mujoco_gym.envs.window_assembly_pipeline import WindowAssemblyPipelin
 
 ENV_ID = "FrankaWindowFineAlignDense-v0"
 
+ENV_ARG_DEFAULTS = {
+    "measurement_noise_translation_std": 0.0,
+    "measurement_noise_angle_std": 0.0,
+    "preinsert_normal_offset": 0.20,
+    "fine_action_sim_steps": 4,
+    "normal_gap_correction_threshold": 0.0005,
+    "normal_gap_correction_sim_steps": 2,
+    "max_normal_gap_drift": 0.008,
+}
+
+ENV_ARG_TO_KWARG = {
+    "measurement_noise_translation_std": "measurement_noise_translation_std",
+    "measurement_noise_angle_std": "measurement_noise_angle_std_deg",
+    "preinsert_normal_offset": "preinsert_normal_offset",
+    "fine_action_sim_steps": "fine_action_sim_steps",
+    "normal_gap_correction_threshold": "normal_gap_correction_threshold",
+    "normal_gap_correction_sim_steps": "normal_gap_correction_sim_steps",
+    "max_normal_gap_drift": "max_normal_gap_drift",
+}
+
+ENV_ARG_FLAGS = {
+    "measurement_noise_translation_std": "--measurement-noise-translation-std",
+    "measurement_noise_angle_std": "--measurement-noise-angle-std",
+    "preinsert_normal_offset": "--preinsert-normal-offset",
+    "fine_action_sim_steps": "--fine-action-sim-steps",
+    "normal_gap_correction_threshold": "--normal-gap-correction-threshold",
+    "normal_gap_correction_sim_steps": "--normal-gap-correction-sim-steps",
+    "max_normal_gap_drift": "--max-normal-gap-drift",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -38,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--measurement-noise-translation-std", type=float, default=0.0)
     parser.add_argument("--measurement-noise-angle-std", type=float, default=0.0)
+    parser.add_argument("--preinsert-normal-offset", type=float, default=0.20)
+    parser.add_argument("--fine-action-sim-steps", type=int, default=4)
+    parser.add_argument("--normal-gap-correction-threshold", type=float, default=0.0005)
+    parser.add_argument("--normal-gap-correction-sim-steps", type=int, default=2)
+    parser.add_argument("--max-normal-gap-drift", type=float, default=0.008)
     return parser.parse_args()
 
 
@@ -70,6 +105,46 @@ def json_default(value: Any) -> Any:
     raise TypeError(f"Cannot JSON-encode {type(value).__name__}")
 
 
+def _provided_flags(argv: list[str]) -> set[str]:
+    flags: set[str] = set()
+    for arg in argv:
+        if not arg.startswith("--"):
+            continue
+        flags.add(arg.split("=", 1)[0])
+    return flags
+
+
+def find_training_config(model_path: str) -> Path | None:
+    model = Path(model_path).expanduser().resolve()
+    start = model.parent if model.suffix or not model.is_dir() else model
+    for directory in (start, *start.parents):
+        candidate = directory / "training_config.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_training_environment_kwargs(model_path: str) -> tuple[dict[str, Any], Path | None]:
+    config_path = find_training_config(model_path)
+    if config_path is None:
+        return {}, None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    train_kwargs = config.get("train_environment_kwargs", {})
+    if not isinstance(train_kwargs, dict):
+        train_kwargs = {}
+    return dict(train_kwargs), config_path
+
+
+def environment_kwargs(args: argparse.Namespace) -> tuple[dict[str, Any], Path | None]:
+    env_kwargs, config_path = load_training_environment_kwargs(args.model)
+    provided = _provided_flags(sys.argv[1:])
+    for arg_name, default_value in ENV_ARG_DEFAULTS.items():
+        kwarg_name = ENV_ARG_TO_KWARG[arg_name]
+        if ENV_ARG_FLAGS[arg_name] in provided or kwarg_name not in env_kwargs:
+            env_kwargs[kwarg_name] = getattr(args, arg_name, default_value)
+    return env_kwargs, config_path
+
+
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     count = max(len(results), 1)
     failures = Counter(
@@ -91,6 +166,10 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         for result in results
     ]
     final_yaw = [abs(float(result["final_errors"]["yaw_error"])) for result in results]
+    final_normal_gap_error = [
+        abs(float(result["final_errors"]["normal_gap_error"]))
+        for result in results
+    ]
     return {
         "episodes": len(results),
         "fine_align_success_rate": sum(r["fine_align_success"] for r in results) / count,
@@ -101,6 +180,8 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_final_translation_error_m": float(np.mean(final_translation)) if results else 0.0,
         "mean_final_tilt_error_rad": float(np.mean(final_tilt)) if results else 0.0,
         "mean_final_yaw_error_rad": float(np.mean(final_yaw)) if results else 0.0,
+        "mean_final_normal_gap_error_m": float(np.mean(final_normal_gap_error)) if results else 0.0,
+        "max_final_normal_gap_error_m": float(np.max(final_normal_gap_error)) if results else 0.0,
         "failure_reason_counts": dict(sorted(failures.items())),
     }
 
@@ -109,6 +190,14 @@ def main() -> None:
     args = parse_args()
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
+    if args.fine_action_sim_steps <= 0 or args.normal_gap_correction_sim_steps <= 0:
+        raise ValueError("--fine-action-sim-steps and --normal-gap-correction-sim-steps must be positive")
+    if args.preinsert_normal_offset <= 0.0:
+        raise ValueError("--preinsert-normal-offset must be positive")
+    if args.normal_gap_correction_threshold < 0.0:
+        raise ValueError("--normal-gap-correction-threshold must be non-negative")
+    if args.max_normal_gap_drift <= 0.0:
+        raise ValueError("--max-normal-gap-drift must be positive")
     output_dir = Path(
         args.output_dir
         or Path("outputs")
@@ -116,12 +205,12 @@ def main() -> None:
         / datetime.now().strftime("%Y%m%d-%H%M%S")
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    env_kwargs, training_config_path = environment_kwargs(args)
     render_mode = "rgb_array" if args.record_video else ("human" if args.render else None)
     env = gym.make(
         ENV_ID,
         render_mode=render_mode,
-        measurement_noise_translation_std=args.measurement_noise_translation_std,
-        measurement_noise_angle_std_deg=args.measurement_noise_angle_std,
+        **env_kwargs,
     )
     model = SAC.load(args.model, device="auto")
     pipeline = WindowAssemblyPipeline(env)
@@ -157,6 +246,8 @@ def main() -> None:
         env.close()
 
     summary = summarize(results)
+    summary["training_config_path"] = str(training_config_path) if training_config_path is not None else ""
+    summary["environment_kwargs"] = env_kwargs
     (output_dir / "episodes.json").write_text(
         json.dumps(results, indent=2, default=json_default), encoding="utf-8"
     )

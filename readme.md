@@ -24,3 +24,15 @@ CUDA_VISIBLE_DEVICES=0 /home/lsy/.conda/envs/panda_rl/bin/python -u evaluate/eva
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/lsy/.conda/envs/panda_rl/bin/python -u evaluate/evaluate_with_video.py   --exp-dir outputs/insert_warmstart_only_seed1   --model-name best_model   --episodes 10   --seed-start 0   --env FrankaPickAndPlaceWindowInsertSparse-v0   --task-geometry-features   --no-task-progress-features   --no-residual-guidance   --expert-warmstart-only   --expert-hint-style insert   --no-vecnormalize   --no-stop-on-success   --max-steps 200   --device cuda
 ```
+
+```bash
+MUJOCO_GL=egl \
+/home/lsy/.conda/envs/panda_rl/bin/python \
+  evaluate/evaluate_window_assembly_pipeline.py \
+  --model outputs/window_fine_align/sac-20260721-194355-seed0/models/best_model.zip \
+  --episodes 5 \
+  --seed 0 \
+  --deterministic \
+  --record-video \
+  --output-dir outputs/window_assembly_visualization/model180959
+```

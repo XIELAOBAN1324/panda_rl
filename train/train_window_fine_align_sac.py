@@ -49,13 +49,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-translation-range", type=float, default=0.015)
     parser.add_argument("--coarse-tilt-range-deg", type=float, default=2.0)
     parser.add_argument("--coarse-yaw-range-deg", type=float, default=4.0)
+    parser.add_argument("--preinsert-normal-offset", type=float, default=0.20)
     parser.add_argument("--position-action-scale", type=float, default=0.0015)
     parser.add_argument("--tilt-action-scale-deg", type=float, default=0.25)
     parser.add_argument("--yaw-action-scale-deg", type=float, default=0.4)
+    parser.add_argument("--fine-action-sim-steps", type=int, default=4)
     parser.add_argument("--translation-tolerance", type=float, default=0.002)
     parser.add_argument("--tilt-tolerance-deg", type=float, default=0.5)
     parser.add_argument("--yaw-tolerance-deg", type=float, default=0.5)
     parser.add_argument("--normal-gap-tolerance", type=float, default=0.001)
+    parser.add_argument("--normal-gap-correction-threshold", type=float, default=0.0005)
+    parser.add_argument("--normal-gap-correction-sim-steps", type=int, default=2)
+    parser.add_argument("--max-normal-gap-drift", type=float, default=0.008)
     parser.add_argument("--measurement-noise-translation-std", type=float, default=0.0005)
     parser.add_argument("--measurement-noise-angle-std", type=float, default=0.1)
     parser.add_argument("--eval-measurement-noise-translation-std", type=float, default=None)
@@ -90,13 +95,18 @@ def environment_kwargs(
         "coarse_translation_range": args.coarse_translation_range,
         "coarse_tilt_range_deg": args.coarse_tilt_range_deg,
         "coarse_yaw_range_deg": args.coarse_yaw_range_deg,
+        "preinsert_normal_offset": args.preinsert_normal_offset,
         "fine_position_action_scale": args.position_action_scale,
         "fine_tilt_action_scale_deg": args.tilt_action_scale_deg,
         "fine_yaw_action_scale_deg": args.yaw_action_scale_deg,
+        "fine_action_sim_steps": args.fine_action_sim_steps,
         "translation_tolerance": args.translation_tolerance,
         "tilt_tolerance_deg": args.tilt_tolerance_deg,
         "yaw_tolerance_deg": args.yaw_tolerance_deg,
         "normal_gap_tolerance": args.normal_gap_tolerance,
+        "normal_gap_correction_threshold": args.normal_gap_correction_threshold,
+        "normal_gap_correction_sim_steps": args.normal_gap_correction_sim_steps,
+        "max_normal_gap_drift": args.max_normal_gap_drift,
         "measurement_noise_translation_std": translation_noise,
         "measurement_noise_angle_std_deg": angle_noise,
         "reward_uses_ground_truth": not args.reward_use_noisy_measurement,
@@ -114,7 +124,14 @@ def make_environment(
         env = Monitor(
             env,
             filename=str(monitor_file),
-            info_keywords=("is_success", "fine_align_success", "failure_reason"),
+            info_keywords=(
+                "is_success",
+                "fine_align_success",
+                "failure_reason",
+                "normal_gap_error",
+                "current_normal_gap",
+                "ee_target_error",
+            ),
         )
         env.reset(seed=seed)
         env.action_space.seed(seed)
@@ -136,6 +153,14 @@ def main() -> None:
     args = parse_args()
     if args.timesteps <= 0 or args.n_envs <= 0:
         raise ValueError("--timesteps and --n-envs must be positive")
+    if args.fine_action_sim_steps <= 0 or args.normal_gap_correction_sim_steps <= 0:
+        raise ValueError("--fine-action-sim-steps and --normal-gap-correction-sim-steps must be positive")
+    if args.preinsert_normal_offset <= 0.0:
+        raise ValueError("--preinsert-normal-offset must be positive")
+    if args.normal_gap_correction_threshold < 0.0:
+        raise ValueError("--normal-gap-correction-threshold must be non-negative")
+    if args.max_normal_gap_drift <= 0.0:
+        raise ValueError("--max-normal-gap-drift must be positive")
 
     random.seed(args.seed)
     np.random.seed(args.seed)

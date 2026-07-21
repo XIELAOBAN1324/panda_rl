@@ -93,6 +93,8 @@ class WindowAssemblyPipeline:
         "tilt_error_t1",
         "tilt_error_t2",
         "yaw_error",
+        "normal_gap_error",
+        "current_normal_gap",
     )
 
     def __init__(self, env: Any) -> None:

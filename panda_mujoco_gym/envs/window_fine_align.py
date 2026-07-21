@@ -16,6 +16,7 @@ from panda_mujoco_gym.envs.pick_and_place_window import FrankaPickAndPlaceWindow
 from panda_mujoco_gym.envs.window_assembly_geometry import (
     alignment_errors_from_corners,
     fine_alignment_costs,
+    normalize_vector,
     ordered_rectangle_corners,
     project_to_rotation_matrix,
     so3_exp,
@@ -48,7 +49,11 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.coarse_translation_range = float(kwargs.pop("coarse_translation_range", 0.015))
         self.coarse_tilt_range_rad = np.deg2rad(float(kwargs.pop("coarse_tilt_range_deg", 2.0)))
         self.coarse_yaw_range_rad = np.deg2rad(float(kwargs.pop("coarse_yaw_range_deg", 4.0)))
-        self.coarse_normal_gap = float(kwargs.pop("coarse_normal_gap", 0.08))
+        kwargs.pop("coarse_normal_gap", None)
+        self.preinsert_normal_offset = float(
+            kwargs.pop("preinsert_normal_offset", 0.20)
+        )
+        self.coarse_normal_gap = self.preinsert_normal_offset
         self.coarse_sampling_attempts = int(kwargs.pop("coarse_sampling_attempts", 24))
 
         self.fine_position_action_scale = float(kwargs.pop("fine_position_action_scale", 0.0015))
@@ -68,9 +73,16 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.max_translation_error = float(kwargs.pop("max_translation_error", 0.05))
         self.max_tilt_error_rad = np.deg2rad(float(kwargs.pop("max_tilt_error_deg", 8.0)))
         self.max_yaw_error_rad = np.deg2rad(float(kwargs.pop("max_yaw_error_deg", 15.0)))
-        self.max_normal_gap_drift = float(kwargs.pop("max_normal_gap_drift", 0.005))
+        self.max_normal_gap_drift = float(kwargs.pop("max_normal_gap_drift", 0.008))
         self.unreachable_position_threshold = float(
             kwargs.pop("unreachable_position_threshold", 0.03)
+        )
+        self.fine_action_sim_steps = int(kwargs.pop("fine_action_sim_steps", 4))
+        self.normal_gap_correction_threshold = float(
+            kwargs.pop("normal_gap_correction_threshold", 0.0005)
+        )
+        self.normal_gap_correction_sim_steps = int(
+            kwargs.pop("normal_gap_correction_sim_steps", 2)
         )
 
         self.measurement_noise_translation_std = float(
@@ -96,6 +108,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "coarse_sampling_attempts",
             "success_hold_steps",
             "hold_steps",
+            "fine_action_sim_steps",
+            "normal_gap_correction_sim_steps",
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -103,7 +117,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "coarse_translation_range",
             "coarse_tilt_range_rad",
             "coarse_yaw_range_rad",
-            "coarse_normal_gap",
+            "preinsert_normal_offset",
             "fine_position_action_scale",
             "fine_tilt_action_scale_rad",
             "fine_yaw_action_scale_rad",
@@ -111,12 +125,19 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "tilt_tolerance_rad",
             "yaw_tolerance_rad",
             "normal_gap_tolerance",
+            "max_normal_gap_drift",
         ):
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"{name} must be positive")
+        if self.normal_gap_correction_threshold < 0.0:
+            raise ValueError("normal_gap_correction_threshold must be non-negative")
+        if self.preinsert_normal_offset <= 0.0:
+            raise ValueError("preinsert_normal_offset must be positive")
 
         self.previous_action = np.zeros(5, dtype=np.float32)
-        self.initial_normal_gap = 0.0
+        self.reference_normal_gap = float(self.preinsert_normal_offset)
+        self.initial_normal_gap = float(self.reference_normal_gap)
+        self.measured_initial_normal_gap = 0.0
         self._previous_state_cost = 0.0
         self._success_counter = 0
         self._elapsed_fine_steps = 0
@@ -130,6 +151,10 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.stage_tracker = WindowAssemblyStageTracker()
         self.coarse_alignment_sample = np.zeros(5, dtype=np.float64)
         self.pipeline_frame_callback: Any | None = None
+        self._fine_frame_center_world: np.ndarray | None = None
+        self._fine_frame_rotation_world: np.ndarray | None = None
+        self._fine_orientation_frame_world: np.ndarray | None = None
+        self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
 
         kwargs.pop("reset_mode", None)
         kwargs.pop("scripted_pickup", None)
@@ -195,19 +220,180 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             float(self.window_opening_size[1] * 0.5),
         )
 
+    def _empty_gap_command_diagnostics(self) -> dict[str, float | bool]:
+        return {
+            "candidate_normal_gap": float("nan"),
+            "commanded_normal_gap": float("nan"),
+            "normal_gap_command_error": float("nan"),
+            "post_action_normal_gap": float("nan"),
+            "post_action_normal_gap_error": float("nan"),
+            "normal_gap_correction_applied": False,
+            "normal_gap_correction_magnitude": 0.0,
+        }
+
+    def _directed_frame_rotation(
+        self,
+        raw_frame_rotation: np.ndarray,
+        frame_center: np.ndarray,
+        glass_center: np.ndarray,
+    ) -> np.ndarray:
+        """Return orthonormal frame axes whose normal points to the glass side."""
+
+        raw_rotation = project_to_rotation_matrix(raw_frame_rotation)
+        raw_normal = normalize_vector(raw_rotation[:, 2])
+        to_glass = np.asarray(glass_center, dtype=np.float64) - np.asarray(
+            frame_center, dtype=np.float64
+        )
+        if float(np.dot(raw_normal, to_glass)) < 0.0:
+            directed_normal = -raw_normal
+        else:
+            directed_normal = raw_normal
+        return np.column_stack(
+            [
+                normalize_vector(raw_rotation[:, 0]),
+                normalize_vector(raw_rotation[:, 1]),
+                directed_normal,
+            ]
+        ).astype(np.float64)
+
+    def _set_episode_frame_from_raw_errors(self, raw_errors: Mapping[str, Any]) -> None:
+        frame_center = np.asarray(raw_errors["frame_center_world"], dtype=np.float64).copy()
+        glass_center = np.asarray(raw_errors["glass_center_world"], dtype=np.float64).copy()
+        raw_frame_rotation = np.asarray(raw_errors["frame_rotation_world"], dtype=np.float64)
+        frame_rotation = self._directed_frame_rotation(
+            raw_frame_rotation, frame_center, glass_center
+        )
+        self._fine_frame_center_world = frame_center
+        self._fine_frame_rotation_world = frame_rotation
+        self._fine_orientation_frame_world = project_to_rotation_matrix(raw_frame_rotation)
+        self.reference_normal_gap = float(self.preinsert_normal_offset)
+
+        # The inherited plane-penetration check treats the positive normal side as
+        # the insertion region. The fine-alignment frame normal points the other
+        # way, toward the glass preinsert side.
+        frame_normal = frame_rotation[:, 2].copy()
+        self.window_center = frame_center.copy()
+        self.window_normal = -frame_normal
+        self.target_glass_normal = self._fine_orientation_frame_world[:, 2].copy()
+        self.window_safe_goal = frame_center + self.reference_normal_gap * frame_normal
+
+    def _current_fine_frame_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._fine_frame_center_world is not None and self._fine_frame_rotation_world is not None:
+            return (
+                self._fine_frame_center_world.copy(),
+                self._fine_frame_rotation_world.copy(),
+            )
+        raw_errors = alignment_errors_from_corners(
+            self.get_glass_corners_world(), self.get_frame_corners_world()
+        )
+        frame_center = np.asarray(raw_errors["frame_center_world"], dtype=np.float64)
+        frame_rotation = self._directed_frame_rotation(
+            np.asarray(raw_errors["frame_rotation_world"], dtype=np.float64),
+            frame_center,
+            np.asarray(raw_errors["glass_center_world"], dtype=np.float64),
+        )
+        return frame_center.copy(), frame_rotation.copy()
+
+    def _current_orientation_frame(self) -> np.ndarray:
+        if self._fine_orientation_frame_world is not None:
+            return self._fine_orientation_frame_world.copy()
+        raw_errors = alignment_errors_from_corners(
+            self.get_glass_corners_world(), self.get_frame_corners_world()
+        )
+        return project_to_rotation_matrix(
+            np.asarray(raw_errors["frame_rotation_world"], dtype=np.float64)
+        )
+
+    def _normal_gap_for_center(
+        self,
+        center: np.ndarray,
+        *,
+        frame_center: np.ndarray | None = None,
+        frame_rotation: np.ndarray | None = None,
+    ) -> float:
+        if frame_center is None or frame_rotation is None:
+            frame_center, frame_rotation = self._current_fine_frame_pose()
+        frame_normal = np.asarray(frame_rotation, dtype=np.float64)[:, 2]
+        return float(np.dot(frame_normal, np.asarray(center, dtype=np.float64) - frame_center))
+
+    def _project_center_to_reference_normal_gap(
+        self,
+        candidate_center: np.ndarray,
+        *,
+        frame_center: np.ndarray | None = None,
+        frame_rotation: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        """Project only the normal component back to the fixed preinsert plane."""
+
+        if frame_center is None or frame_rotation is None:
+            frame_center, frame_rotation = self._current_fine_frame_pose()
+        frame_center = np.asarray(frame_center, dtype=np.float64)
+        frame_rotation = np.asarray(frame_rotation, dtype=np.float64)
+        frame_t1 = frame_rotation[:, 0]
+        frame_t2 = frame_rotation[:, 1]
+        frame_normal = frame_rotation[:, 2]
+        candidate_center = np.asarray(candidate_center, dtype=np.float64)
+        candidate_gap = float(np.dot(frame_normal, candidate_center - frame_center))
+        target_center = candidate_center + (
+            self.reference_normal_gap - candidate_gap
+        ) * frame_normal
+        commanded_gap = float(np.dot(frame_normal, target_center - frame_center))
+        command_error = float(commanded_gap - self.reference_normal_gap)
+        candidate_u = float(np.dot(frame_t1, candidate_center - frame_center))
+        target_u = float(np.dot(frame_t1, target_center - frame_center))
+        candidate_v = float(np.dot(frame_t2, candidate_center - frame_center))
+        target_v = float(np.dot(frame_t2, target_center - frame_center))
+        if not np.isclose(commanded_gap, self.reference_normal_gap, atol=1e-8):
+            raise RuntimeError("Projected center did not reach the reference normal gap")
+        if not np.isclose(candidate_u, target_u, atol=1e-8):
+            raise RuntimeError("Normal-gap projection changed the frame_t1 coordinate")
+        if not np.isclose(candidate_v, target_v, atol=1e-8):
+            raise RuntimeError("Normal-gap projection changed the frame_t2 coordinate")
+        return target_center, {
+            "candidate_normal_gap": candidate_gap,
+            "commanded_normal_gap": commanded_gap,
+            "normal_gap_command_error": command_error,
+        }
+
     def get_fine_alignment_errors(self) -> dict[str, np.ndarray | float]:
-        """Return ground-truth five-DoF errors plus normal-gap diagnostics."""
+        """Return five-DoF errors plus fixed preinsert-plane gap diagnostics.
+
+        ``normal_gap_drift`` is kept for log compatibility, but it now means the
+        error relative to ``reference_normal_gap`` rather than drift from the
+        measured reset-time gap.
+        """
 
         errors = alignment_errors_from_corners(
             self.get_glass_corners_world(), self.get_frame_corners_world()
         )
+        frame_center, frame_rotation = self._current_fine_frame_pose()
+        orientation_frame = self._current_orientation_frame()
+        glass_center = np.asarray(errors["glass_center_world"], dtype=np.float64)
+        glass_rotation = np.asarray(errors["glass_rotation_world"], dtype=np.float64)
         center_delta = np.asarray(errors["glass_center_world"]) - np.asarray(
-            errors["frame_center_world"]
+            frame_center
         )
-        current_gap = float(np.dot(np.asarray(errors["frame_normal_world"]), center_delta))
+        relative_rotation = orientation_frame.T @ glass_rotation
+        rotation_error_world = orientation_frame @ so3_log(relative_rotation)
+        current_gap = float(np.dot(frame_rotation[:, 2], center_delta))
+        normal_gap_error = current_gap - float(self.reference_normal_gap)
+        errors["error_u"] = float(np.dot(frame_rotation[:, 0], center_delta))
+        errors["error_v"] = float(np.dot(frame_rotation[:, 1], center_delta))
+        errors["tilt_error_t1"] = float(np.dot(frame_rotation[:, 0], rotation_error_world))
+        errors["tilt_error_t2"] = float(np.dot(frame_rotation[:, 1], rotation_error_world))
+        errors["yaw_error"] = float(np.dot(frame_rotation[:, 2], rotation_error_world))
+        errors["frame_center_world"] = frame_center.copy()
+        errors["frame_rotation_world"] = frame_rotation.copy()
+        errors["frame_normal_world"] = frame_rotation[:, 2].copy()
         errors["initial_normal_gap"] = float(self.initial_normal_gap)
+        errors["reference_normal_gap"] = float(self.reference_normal_gap)
+        errors["measured_initial_normal_gap"] = float(self.measured_initial_normal_gap)
+        errors["initial_normal_gap_error"] = float(
+            self.measured_initial_normal_gap - self.reference_normal_gap
+        )
         errors["current_normal_gap"] = current_gap
-        errors["normal_gap_drift"] = current_gap - float(self.initial_normal_gap)
+        errors["normal_gap_error"] = normal_gap_error
+        errors["normal_gap_drift"] = normal_gap_error
         return errors
 
     # ------------------------------------------------------------------
@@ -234,6 +420,10 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self._last_max_plane_penetration = 0.0
         self._simulation_step_count = 0
         self.stage_tracker = WindowAssemblyStageTracker()
+        self._fine_frame_center_world = None
+        self._fine_frame_rotation_world = None
+        self._fine_orientation_frame_world = None
+        self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
 
         self.window_center = self._sample_window_center()
         self.model.body_pos[self.window_body_id] = self.window_center
@@ -246,11 +436,10 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         frame_errors = alignment_errors_from_corners(
             self.get_glass_corners_world(), self.get_frame_corners_world()
         )
-        frame_rotation = np.asarray(frame_errors["frame_rotation_world"], dtype=np.float64)
-        self.window_normal = frame_rotation[:, 2].copy()
-        self.target_glass_normal = frame_rotation[:, 2].copy()
-        self.window_center = np.asarray(frame_errors["frame_center_world"], dtype=np.float64).copy()
-        self.window_safe_goal = self.window_center - self.window_normal * self.coarse_normal_gap
+        self._set_episode_frame_from_raw_errors(frame_errors)
+        frame_center, frame_rotation = self._current_fine_frame_pose()
+        orientation_frame = self._current_orientation_frame()
+        frame_normal = frame_rotation[:, 2]
 
         object_position = self.get_object_position().copy()
         approach_position = object_position + frame_rotation[:, 0] * 0.12
@@ -290,11 +479,11 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             ),
         )
 
-        transport_position = self.window_center - self.window_normal * max(
-            self.coarse_normal_gap + 0.12, 0.16
+        transport_position = frame_center + frame_normal * max(
+            self.preinsert_normal_offset + 0.12, 0.28
         )
         transport_position[2] = max(
-            float(lift_position[2]), float(self.window_center[2] + 0.12)
+            float(lift_position[2]), float(frame_center[2] + 0.12)
         )
 
         def reorient() -> None:
@@ -305,7 +494,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             )
             self._move_attached_object_pose(
                 transport_position,
-                frame_rotation @ self.GLASS_ASSEMBLY_FRAME,
+                orientation_frame @ self.GLASS_ASSEMBLY_FRAME,
                 3 * self.post_grasp_motion_steps,
             )
 
@@ -336,15 +525,12 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.insert_success = False
         self.hold_success = False
 
-        raw_errors = alignment_errors_from_corners(
-            self.get_glass_corners_world(), self.get_frame_corners_world()
+        self.reference_normal_gap = float(self.preinsert_normal_offset)
+        self.initial_normal_gap = float(self.reference_normal_gap)
+        self.measured_initial_normal_gap = self._normal_gap_for_center(
+            self.get_object_position().copy()
         )
-        center_delta = np.asarray(raw_errors["glass_center_world"]) - np.asarray(
-            raw_errors["frame_center_world"]
-        )
-        self.initial_normal_gap = float(
-            np.dot(np.asarray(raw_errors["frame_normal_world"]), center_delta)
-        )
+        self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
         errors = self.get_fine_alignment_errors()
         measured_errors = self._noisy_errors(errors)
         reward_errors = errors if self.reward_uses_ground_truth else measured_errors
@@ -380,9 +566,15 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
 
     def _sample_and_apply_coarse_alignment(self, frame_rotation: np.ndarray) -> None:
         canonical_state = self._capture_sim_state()
-        frame_center = np.mean(self.get_frame_corners_world(), axis=0)
+        frame_center, frame_rotation = self._current_fine_frame_pose()
+        nominal_preinsert_center = (
+            frame_center + self.preinsert_normal_offset * frame_rotation[:, 2]
+        )
         last_reason = "no_candidate"
         last_errors: Mapping[str, Any] | None = None
+        last_target_center: np.ndarray | None = None
+        last_object_target_error = 0.0
+        last_ee_target_error = 0.0
         for _ in range(self.coarse_sampling_attempts):
             self._restore_sim_state(canonical_state)
             sample = np.array(
@@ -396,21 +588,38 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 dtype=np.float64,
             )
             target_center = (
-                frame_center
-                - self.coarse_normal_gap * frame_rotation[:, 2]
+                nominal_preinsert_center
                 + sample[0] * frame_rotation[:, 0]
                 + sample[1] * frame_rotation[:, 1]
             )
-            target_assembly_rotation = frame_rotation @ so3_exp(sample[2:5])
+            commanded_gap = float(np.dot(frame_rotation[:, 2], target_center - frame_center))
+            if not np.isclose(commanded_gap, self.preinsert_normal_offset, atol=1e-8):
+                raise RuntimeError("Coarse preinsert target left the fixed normal plane")
+            rotation_vector_world = (
+                sample[2] * frame_rotation[:, 0]
+                + sample[3] * frame_rotation[:, 1]
+                + sample[4] * frame_rotation[:, 2]
+            )
+            target_assembly_rotation = (
+                so3_exp(rotation_vector_world) @ self._current_orientation_frame()
+            )
             target_rotation = target_assembly_rotation @ self.GLASS_ASSEMBLY_FRAME
             self._move_attached_object_pose(
                 target_center, target_rotation, 5 * self.post_grasp_motion_steps
             )
             self._stabilize_reset_state()
             errors = self.get_fine_alignment_errors()
-            errors["normal_gap_drift"] = 0.0
+            last_target_center = target_center.copy()
+            last_object_target_error = float(
+                np.linalg.norm(self.get_object_position().copy() - target_center)
+            )
+            last_ee_target_error = float(self._last_ee_target_error)
             last_errors = errors
-            last_reason = self._coarse_candidate_failure(errors)
+            last_reason = self._coarse_candidate_failure(
+                errors,
+                target_center=target_center,
+                object_target_error=last_object_target_error,
+            )
             if not last_reason:
                 self.coarse_alignment_sample = sample
                 return
@@ -421,25 +630,42 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 f" (u={float(last_errors['error_u']):.4f}, "
                 f"v={float(last_errors['error_v']):.4f}, "
                 f"gap={float(last_errors['current_normal_gap']):.4f}, "
+                f"gap_error={float(last_errors['normal_gap_error']):.4f}, "
                 f"tilt=({float(last_errors['tilt_error_t1']):.4f},"
                 f"{float(last_errors['tilt_error_t2']):.4f}), "
-                f"yaw={float(last_errors['yaw_error']):.4f})"
+                f"yaw={float(last_errors['yaw_error']):.4f}, "
+                f"ee_target_error={last_ee_target_error:.4f}, "
+                f"object_target_error={last_object_target_error:.4f})"
             )
+        if last_target_center is not None:
+            diagnostics += f" target_center={last_target_center.tolist()}"
         raise RuntimeError(
             f"Unable to sample a recoverable coarse-alignment state: {last_reason}{diagnostics}"
         )
 
-    def _coarse_candidate_failure(self, errors: Mapping[str, Any]) -> str:
+    def _coarse_candidate_failure(
+        self,
+        errors: Mapping[str, Any],
+        *,
+        target_center: np.ndarray,
+        object_target_error: float,
+    ) -> str:
         if not self._grasp_weld_is_active():
             return "suction_weld_broken"
+        if (
+            self._last_ee_target_error > self.unreachable_position_threshold
+            or object_target_error > self.unreachable_position_threshold
+            or not np.all(np.isfinite(np.asarray(target_center, dtype=np.float64)))
+        ):
+            return "coarse_align_preinsert_pose_unreachable"
         if self._has_window_collision():
             return "illegal_window_collision"
         if self._max_object_penetration() > self.plane_constraint_eps:
             return "glass_entered_insertion_region"
-        if abs(float(errors["current_normal_gap"])) < 0.02:
+        if float(errors["current_normal_gap"]) < 0.02:
             return "normal_gap_not_safe"
-        if abs(float(errors["current_normal_gap"]) + self.coarse_normal_gap) > 0.015:
-            return "coarse_normal_gap_not_reached"
+        if abs(float(errors["current_normal_gap"]) - self.preinsert_normal_offset) > 0.015:
+            return "coarse_preinsert_gap_not_reached"
         if abs(float(errors["error_u"])) > self.coarse_translation_range:
             return "coarse_translation_target_not_reached"
         if abs(float(errors["error_v"])) > self.coarse_translation_range:
@@ -480,24 +706,61 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         finite_action = bool(np.all(np.isfinite(action_array)))
         clipped_action = np.clip(action_array, -1.0, 1.0) if finite_action else np.zeros(5, dtype=np.float32)
         target_center = self.get_object_position().copy()
+        self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
         if finite_action and self._grasp_weld_is_active():
             errors_before = self.get_fine_alignment_errors()
+            frame_center = np.asarray(errors_before["frame_center_world"], dtype=np.float64)
             frame_rotation = np.asarray(errors_before["frame_rotation_world"], dtype=np.float64)
-            translation_delta = (
-                clipped_action[0] * self.fine_position_action_scale * frame_rotation[:, 0]
+            current_center = self.get_object_position().copy()
+            candidate_center = (
+                current_center
+                + clipped_action[0] * self.fine_position_action_scale * frame_rotation[:, 0]
                 + clipped_action[1] * self.fine_position_action_scale * frame_rotation[:, 1]
             )
+            translation_delta = candidate_center - current_center
             normal_component = abs(float(np.dot(translation_delta, frame_rotation[:, 2])))
             if normal_component > 1e-10:
                 raise RuntimeError("Fine-alignment translation contains a normal component")
+            target_center, command_diagnostics = self._project_center_to_reference_normal_gap(
+                candidate_center,
+                frame_center=frame_center,
+                frame_rotation=frame_rotation,
+            )
             rotation_vector_world = (
                 clipped_action[2] * self.fine_tilt_action_scale_rad * frame_rotation[:, 0]
                 + clipped_action[3] * self.fine_tilt_action_scale_rad * frame_rotation[:, 1]
                 + clipped_action[4] * self.fine_yaw_action_scale_rad * frame_rotation[:, 2]
             )
-            target_center = target_center + translation_delta
             target_rotation = so3_exp(rotation_vector_world) @ self.get_object_rotation_matrix()
-            self._move_attached_object_pose(target_center, target_rotation, 1)
+            self._move_attached_object_pose(
+                target_center,
+                target_rotation,
+                self.fine_action_sim_steps,
+                center_feedback_gain=1.0,
+            )
+            post_center = self.get_object_position().copy()
+            post_gap = float(np.dot(frame_rotation[:, 2], post_center - frame_center))
+            post_gap_error = post_gap - float(self.reference_normal_gap)
+            correction_applied = False
+            correction_magnitude = 0.0
+            if abs(post_gap_error) > self.normal_gap_correction_threshold:
+                corrected_center = post_center - post_gap_error * frame_rotation[:, 2]
+                current_rotation = self.get_object_rotation_matrix().copy()
+                self._move_attached_object_pose(
+                    corrected_center,
+                    current_rotation,
+                    self.normal_gap_correction_sim_steps,
+                    center_feedback_gain=1.0,
+                )
+                correction_applied = True
+                correction_magnitude = abs(float(post_gap_error))
+            self._last_step_gap_diagnostics = {
+                **command_diagnostics,
+                "post_action_normal_gap": post_gap,
+                "post_action_normal_gap_error": post_gap_error,
+                "normal_gap_correction_applied": bool(correction_applied),
+                "normal_gap_correction_magnitude": float(correction_magnitude),
+            }
 
         self._elapsed_fine_steps += 1
         ground_truth_errors = self.get_fine_alignment_errors()
@@ -588,7 +851,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             and abs(float(errors["tilt_error_t1"])) < self.tilt_tolerance_rad
             and abs(float(errors["tilt_error_t2"])) < self.tilt_tolerance_rad
             and abs(float(errors["yaw_error"])) < self.yaw_tolerance_rad
-            and abs(float(errors["normal_gap_drift"])) < self.normal_gap_tolerance
+            and abs(float(errors["normal_gap_error"])) < self.normal_gap_tolerance
         )
 
     def _safety_failure_reason(
@@ -604,6 +867,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "tilt_error_t1",
             "tilt_error_t2",
             "yaw_error",
+            "normal_gap_error",
             "normal_gap_drift",
             "current_normal_gap",
         )
@@ -616,6 +880,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         collision_reason = self._window_collision_reason()
         if collision_reason:
             return collision_reason
+        # Kept as the legacy failure string for log compatibility; the checked
+        # quantity is now fixed-plane normal-gap error.
         if abs(float(errors["normal_gap_drift"])) > self.max_normal_gap_drift:
             return "normal_gap_drift_exceeded"
         if max(abs(float(errors["error_u"])), abs(float(errors["error_v"]))) > self.max_translation_error:
@@ -632,7 +898,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             return "end_effector_unreachable"
         if self._max_object_penetration() > self.plane_constraint_eps:
             return "glass_entered_insertion_region"
-        if float(errors["current_normal_gap"]) > -0.01:
+        if float(errors["current_normal_gap"]) < 0.01:
             return "glass_entered_insertion_region"
         if not np.all(np.isfinite(np.asarray(target_center))):
             return "end_effector_unreachable"
@@ -641,7 +907,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
     # ------------------------------------------------------------------
     # Script-only insertion and hold. Neither method accepts a policy action.
     # ------------------------------------------------------------------
-    def run_scripted_insert(self, *, max_steps: int = 200) -> bool:
+    def run_scripted_insert(self, *, max_steps: int = 300) -> bool:
         """Insert only after fine-align success, moving strictly along frame normal."""
 
         if not self.ready_for_insert:
@@ -672,12 +938,20 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 break
             current_gap = float(errors["current_normal_gap"])
             target_gap = -abs(self.insert_final_gap)
-            if current_gap >= target_gap - 5e-4:
+            if current_gap <= target_gap + 5e-4:
                 success = True
                 failure_reason = ""
                 break
             total_distance = target_gap - insert_start_gap
-            commanded_progress = min(commanded_progress + self.insert_step_size, total_distance)
+            if abs(total_distance) < 1e-12:
+                commanded_progress = total_distance
+            else:
+                step = np.sign(total_distance) * self.insert_step_size
+                next_progress = commanded_progress + step
+                if abs(next_progress) >= abs(total_distance):
+                    commanded_progress = total_distance
+                else:
+                    commanded_progress = next_progress
             # The commanded path has constant t1/t2 coordinates and constant
             # orientation. Feedback merely holds those values against tracking
             # drift; the script introduces no new in-plane/rotation command.
@@ -741,10 +1015,15 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
     def _noisy_errors(self, errors: Mapping[str, Any]) -> dict[str, Any]:
         measured = dict(errors)
         if self.measurement_noise_translation_std > 0.0:
-            for key in ("error_u", "error_v", "normal_gap_drift"):
+            for key in ("error_u", "error_v"):
                 measured[key] = float(errors[key]) + float(
                     self.np_random.normal(0.0, self.measurement_noise_translation_std)
                 )
+            gap_noise = float(
+                self.np_random.normal(0.0, self.measurement_noise_translation_std)
+            )
+            measured["normal_gap_error"] = float(errors["normal_gap_error"]) + gap_noise
+            measured["normal_gap_drift"] = measured["normal_gap_error"]
         if self.measurement_noise_angle_std_rad > 0.0:
             for key in ("tilt_error_t1", "tilt_error_t2", "yaw_error"):
                 measured[key] = float(errors[key]) + float(
@@ -762,7 +1041,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 float(errors["tilt_error_t1"]) / self.tilt_tolerance_rad,
                 float(errors["tilt_error_t2"]) / self.tilt_tolerance_rad,
                 float(errors["yaw_error"]) / self.yaw_tolerance_rad,
-                float(errors["normal_gap_drift"]) / self.normal_gap_tolerance,
+                float(errors["normal_gap_error"]) / self.normal_gap_tolerance,
             ],
             dtype=np.float32,
         )
@@ -780,9 +1059,33 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "tilt_error_t1": float(errors["tilt_error_t1"]),
             "tilt_error_t2": float(errors["tilt_error_t2"]),
             "yaw_error": float(errors["yaw_error"]),
+            "preinsert_normal_offset": float(self.preinsert_normal_offset),
+            "reference_normal_gap": float(errors["reference_normal_gap"]),
+            "measured_initial_normal_gap": float(errors["measured_initial_normal_gap"]),
+            "initial_normal_gap_error": float(errors["initial_normal_gap_error"]),
             "initial_normal_gap": float(errors["initial_normal_gap"]),
             "current_normal_gap": float(errors["current_normal_gap"]),
+            "normal_gap_error": float(errors["normal_gap_error"]),
             "normal_gap_drift": float(errors["normal_gap_drift"]),
+            "candidate_normal_gap": float(self._last_step_gap_diagnostics["candidate_normal_gap"]),
+            "commanded_normal_gap": float(self._last_step_gap_diagnostics["commanded_normal_gap"]),
+            "normal_gap_command_error": float(
+                self._last_step_gap_diagnostics["normal_gap_command_error"]
+            ),
+            "post_action_normal_gap": float(
+                self._last_step_gap_diagnostics["post_action_normal_gap"]
+            ),
+            "post_action_normal_gap_error": float(
+                self._last_step_gap_diagnostics["post_action_normal_gap_error"]
+            ),
+            "normal_gap_correction_applied": bool(
+                self._last_step_gap_diagnostics["normal_gap_correction_applied"]
+            ),
+            "normal_gap_correction_magnitude": float(
+                self._last_step_gap_diagnostics["normal_gap_correction_magnitude"]
+            ),
+            "fine_action_sim_steps": int(self.fine_action_sim_steps),
+            "ee_target_error": float(self._last_ee_target_error),
             "corner_distances": np.asarray(errors["corner_distances"], dtype=np.float64).copy(),
             "glass_center_world": np.asarray(errors["glass_center_world"], dtype=np.float64).copy(),
             "frame_center_world": np.asarray(errors["frame_center_world"], dtype=np.float64).copy(),
@@ -817,6 +1120,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         target_object_center: np.ndarray,
         target_object_rotation: np.ndarray,
         n_steps: int,
+        *,
+        center_feedback_gain: float = 0.0,
     ) -> None:
         if not self._grasp_weld_is_active():
             raise RuntimeError("Cannot move an object that is not suction-attached")
@@ -841,6 +1146,9 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             )
             desired_ee_rotation = interpolated_delta @ start_ee_rotation
             ee_position = desired_center - desired_ee_rotation @ self._grasp_relative_position
+            if center_feedback_gain != 0.0:
+                center_error = desired_center - self.get_object_position().copy()
+                ee_position = ee_position + float(center_feedback_gain) * center_error
             last_ee_target = ee_position.copy()
             self.set_mocap_pose(ee_position, ee_quaternion)
             self._mujoco_step()
