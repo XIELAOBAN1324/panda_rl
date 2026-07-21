@@ -51,7 +51,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.coarse_yaw_range_rad = np.deg2rad(float(kwargs.pop("coarse_yaw_range_deg", 4.0)))
         kwargs.pop("coarse_normal_gap", None)
         self.preinsert_normal_offset = float(
-            kwargs.pop("preinsert_normal_offset", 0.20)
+            kwargs.pop("preinsert_normal_offset", 0.08)
         )
         self.coarse_normal_gap = self.preinsert_normal_offset
         self.coarse_sampling_attempts = int(kwargs.pop("coarse_sampling_attempts", 24))
@@ -97,6 +97,19 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
 
         self.insert_step_size = float(kwargs.pop("insert_step_size", 0.001))
         self.insert_final_gap = float(kwargs.pop("insert_final_gap", 0.005))
+        self.insert_action_sim_steps = int(kwargs.pop("insert_action_sim_steps", 4))
+        self.insert_translation_abort_tolerance = float(
+            kwargs.pop("insert_translation_abort_tolerance", 0.0025)
+        )
+        self.insert_tilt_abort_tolerance_rad = np.deg2rad(
+            float(kwargs.pop("insert_tilt_abort_tolerance_deg", 0.6))
+        )
+        self.insert_yaw_abort_tolerance_rad = np.deg2rad(
+            float(kwargs.pop("insert_yaw_abort_tolerance_deg", 0.6))
+        )
+        self.insert_alignment_violation_hold_steps = int(
+            kwargs.pop("insert_alignment_violation_hold_steps", 2)
+        )
         self.hold_steps = int(kwargs.pop("hold_steps", 40))
         self.hold_position_tolerance = float(kwargs.pop("hold_position_tolerance", 0.003))
         self.hold_angle_tolerance_rad = np.deg2rad(
@@ -110,6 +123,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "hold_steps",
             "fine_action_sim_steps",
             "normal_gap_correction_sim_steps",
+            "insert_action_sim_steps",
+            "insert_alignment_violation_hold_steps",
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -126,6 +141,11 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "yaw_tolerance_rad",
             "normal_gap_tolerance",
             "max_normal_gap_drift",
+            "insert_step_size",
+            "insert_final_gap",
+            "insert_translation_abort_tolerance",
+            "insert_tilt_abort_tolerance_rad",
+            "insert_yaw_abort_tolerance_rad",
         ):
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"{name} must be positive")
@@ -133,6 +153,30 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             raise ValueError("normal_gap_correction_threshold must be non-negative")
         if self.preinsert_normal_offset <= 0.0:
             raise ValueError("preinsert_normal_offset must be positive")
+        if self.insert_translation_abort_tolerance < self.translation_tolerance:
+            raise ValueError(
+                "insert_translation_abort_tolerance must be at least translation_tolerance"
+            )
+        if self.insert_tilt_abort_tolerance_rad < self.tilt_tolerance_rad:
+            raise ValueError(
+                "insert_tilt_abort_tolerance_deg must be at least tilt_tolerance_deg"
+            )
+        if self.insert_yaw_abort_tolerance_rad < self.yaw_tolerance_rad:
+            raise ValueError(
+                "insert_yaw_abort_tolerance_deg must be at least yaw_tolerance_deg"
+            )
+        if self.insert_translation_abort_tolerance > self.max_translation_error:
+            raise ValueError(
+                "insert_translation_abort_tolerance must not exceed max_translation_error"
+            )
+        if self.insert_tilt_abort_tolerance_rad > self.max_tilt_error_rad:
+            raise ValueError(
+                "insert_tilt_abort_tolerance_deg must not exceed max_tilt_error_deg"
+            )
+        if self.insert_yaw_abort_tolerance_rad > self.max_yaw_error_rad:
+            raise ValueError(
+                "insert_yaw_abort_tolerance_deg must not exceed max_yaw_error_deg"
+            )
 
         self.previous_action = np.zeros(5, dtype=np.float32)
         self.reference_normal_gap = float(self.preinsert_normal_offset)
@@ -155,6 +199,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self._fine_frame_rotation_world: np.ndarray | None = None
         self._fine_orientation_frame_world: np.ndarray | None = None
         self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
+        self._last_insert_diagnostics = self._empty_insert_diagnostics()
 
         kwargs.pop("reset_mode", None)
         kwargs.pop("scripted_pickup", None)
@@ -230,6 +275,48 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "normal_gap_correction_applied": False,
             "normal_gap_correction_magnitude": 0.0,
         }
+
+    def _empty_insert_diagnostics(self) -> dict[str, Any]:
+        return {
+            "insert_start_error_u": float("nan"),
+            "insert_start_error_v": float("nan"),
+            "insert_start_tilt_t1": float("nan"),
+            "insert_start_tilt_t2": float("nan"),
+            "insert_start_yaw": float("nan"),
+            "insert_start_normal_gap": float("nan"),
+            "insert_max_abs_error_u": 0.0,
+            "insert_max_abs_error_v": 0.0,
+            "insert_max_abs_tilt_t1": 0.0,
+            "insert_max_abs_tilt_t2": 0.0,
+            "insert_max_abs_yaw": 0.0,
+            "insert_alignment_violation_count": 0,
+            "insert_alignment_violation_hold_steps": int(
+                self.insert_alignment_violation_hold_steps
+            ),
+            "insert_action_sim_steps": int(self.insert_action_sim_steps),
+            "insert_translation_abort_tolerance": float(
+                self.insert_translation_abort_tolerance
+            ),
+            "insert_tilt_abort_tolerance": float(self.insert_tilt_abort_tolerance_rad),
+            "insert_yaw_abort_tolerance": float(self.insert_yaw_abort_tolerance_rad),
+            "insert_step_size": float(self.insert_step_size),
+            "insert_steps": 0,
+            "insert_failure_error_u": float("nan"),
+            "insert_failure_error_v": float("nan"),
+            "insert_failure_tilt_t1": float("nan"),
+            "insert_failure_tilt_t2": float("nan"),
+            "insert_failure_yaw": float("nan"),
+            "insert_failure_normal_gap": float("nan"),
+            "insert_failure_step": -1,
+            "insert_failure_depth": float("nan"),
+            "insert_ee_target_error": float("nan"),
+            "insert_depth": 0.0,
+            "failure_reason": "",
+            "failure_category": "",
+        }
+
+    def get_last_insert_diagnostics(self) -> dict[str, Any]:
+        return dict(self._last_insert_diagnostics)
 
     def _directed_frame_rotation(
         self,
@@ -424,6 +511,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self._fine_frame_rotation_world = None
         self._fine_orientation_frame_world = None
         self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
+        self._last_insert_diagnostics = self._empty_insert_diagnostics()
 
         self.window_center = self._sample_window_center()
         self.model.body_pos[self.window_body_id] = self.window_center
@@ -531,6 +619,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             self.get_object_position().copy()
         )
         self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
+        self._last_insert_diagnostics = self._empty_insert_diagnostics()
         errors = self.get_fine_alignment_errors()
         measured_errors = self._noisy_errors(errors)
         reward_errors = errors if self.reward_uses_ground_truth else measured_errors
@@ -907,6 +996,71 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
     # ------------------------------------------------------------------
     # Script-only insertion and hold. Neither method accepts a policy action.
     # ------------------------------------------------------------------
+    def _initialize_insert_diagnostics(
+        self,
+        start_errors: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        diagnostics = self._empty_insert_diagnostics()
+        diagnostics.update(
+            {
+                "insert_start_error_u": float(start_errors["error_u"]),
+                "insert_start_error_v": float(start_errors["error_v"]),
+                "insert_start_tilt_t1": float(start_errors["tilt_error_t1"]),
+                "insert_start_tilt_t2": float(start_errors["tilt_error_t2"]),
+                "insert_start_yaw": float(start_errors["yaw_error"]),
+                "insert_start_normal_gap": float(start_errors["current_normal_gap"]),
+            }
+        )
+        self._last_insert_diagnostics = diagnostics
+        self._update_insert_error_diagnostics(start_errors)
+        return diagnostics
+
+    def _update_insert_error_diagnostics(self, errors: Mapping[str, Any]) -> None:
+        diagnostics = self._last_insert_diagnostics
+        diagnostics["insert_max_abs_error_u"] = max(
+            float(diagnostics["insert_max_abs_error_u"]), abs(float(errors["error_u"]))
+        )
+        diagnostics["insert_max_abs_error_v"] = max(
+            float(diagnostics["insert_max_abs_error_v"]), abs(float(errors["error_v"]))
+        )
+        diagnostics["insert_max_abs_tilt_t1"] = max(
+            float(diagnostics["insert_max_abs_tilt_t1"]),
+            abs(float(errors["tilt_error_t1"])),
+        )
+        diagnostics["insert_max_abs_tilt_t2"] = max(
+            float(diagnostics["insert_max_abs_tilt_t2"]),
+            abs(float(errors["tilt_error_t2"])),
+        )
+        diagnostics["insert_max_abs_yaw"] = max(
+            float(diagnostics["insert_max_abs_yaw"]), abs(float(errors["yaw_error"]))
+        )
+        diagnostics["insert_ee_target_error"] = float(self._last_ee_target_error)
+
+    def _record_insert_failure(
+        self,
+        errors: Mapping[str, Any],
+        *,
+        failure_reason: str,
+        step_index: int,
+        depth: float,
+        failure_category: str = "",
+    ) -> None:
+        self._last_insert_diagnostics.update(
+            {
+                "insert_failure_error_u": float(errors["error_u"]),
+                "insert_failure_error_v": float(errors["error_v"]),
+                "insert_failure_tilt_t1": float(errors["tilt_error_t1"]),
+                "insert_failure_tilt_t2": float(errors["tilt_error_t2"]),
+                "insert_failure_yaw": float(errors["yaw_error"]),
+                "insert_failure_normal_gap": float(errors["current_normal_gap"]),
+                "insert_failure_step": int(step_index),
+                "insert_failure_depth": float(depth),
+                "insert_ee_target_error": float(self._last_ee_target_error),
+                "failure_reason": str(failure_reason),
+                "failure_category": str(failure_category),
+            }
+        )
+
     def run_scripted_insert(self, *, max_steps: int = 300) -> bool:
         """Insert only after fine-align success, moving strictly along frame normal."""
 
@@ -917,49 +1071,116 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.stage = WindowAssemblyStage.INSERT
         self.stage_tracker.begin(self.stage, self._simulation_step_count)
         failure_reason = "insert_step_limit"
+        failure_category = ""
         success = False
         start_errors = self.get_fine_alignment_errors()
         insert_start_center = self.get_object_position().copy()
         insert_start_rotation = self.get_object_rotation_matrix().copy()
         insert_start_gap = float(start_errors["current_normal_gap"])
         frame_normal = np.asarray(start_errors["frame_normal_world"], dtype=np.float64)
-        commanded_progress = 0.0
-        for _ in range(max(int(max_steps), 1)):
+        target_gap = -abs(self.insert_final_gap)
+        insert_direction = -frame_normal if insert_start_gap >= target_gap else frame_normal
+        total_depth = abs(float(insert_start_gap - target_gap))
+        commanded_depth = 0.0
+        inserted_steps = 0
+        alignment_violation_count = 0
+        self._initialize_insert_diagnostics(start_errors)
+
+        last_errors = start_errors
+        for step_index in range(max(int(max_steps), 1)):
             errors = self.get_fine_alignment_errors()
-            if not self._grasp_weld_is_active():
-                failure_reason = "suction_weld_broken"
+            last_errors = errors
+            self._update_insert_error_diagnostics(errors)
+            self._last_insert_diagnostics["insert_alignment_violation_count"] = int(
+                alignment_violation_count
+            )
+            self._last_insert_diagnostics["insert_depth"] = float(commanded_depth)
+
+            target_center = insert_start_center + commanded_depth * insert_direction
+            immediate_failure = self._insert_immediate_failure_reason(
+                errors,
+                target_center=target_center,
+            )
+            if immediate_failure:
+                failure_reason = immediate_failure
+                self._record_insert_failure(
+                    errors,
+                    failure_reason=failure_reason,
+                    step_index=step_index,
+                    depth=commanded_depth,
+                )
                 break
-            if not self._alignment_only_within_tolerance(errors):
-                failure_reason = "alignment_degraded_during_insert"
+
+            alignment_violation_count, alignment_failure = (
+                self._update_insert_alignment_violation_count(
+                    errors,
+                    alignment_violation_count,
+                )
+            )
+            self._last_insert_diagnostics["insert_alignment_violation_count"] = int(
+                alignment_violation_count
+            )
+            if alignment_failure:
+                failure_reason = alignment_failure
+                failure_category = "alignment_degraded_during_insert"
+                self._record_insert_failure(
+                    errors,
+                    failure_reason=failure_reason,
+                    step_index=step_index,
+                    depth=commanded_depth,
+                    failure_category=failure_category,
+                )
                 break
-            collision_reason = self._window_collision_reason()
-            if collision_reason:
-                failure_reason = collision_reason
-                break
+
             current_gap = float(errors["current_normal_gap"])
-            target_gap = -abs(self.insert_final_gap)
-            if current_gap <= target_gap + 5e-4:
+            if (
+                current_gap <= target_gap + 5e-4
+                and commanded_depth >= total_depth - 1e-12
+            ):
                 success = True
                 failure_reason = ""
                 break
-            total_distance = target_gap - insert_start_gap
-            if abs(total_distance) < 1e-12:
-                commanded_progress = total_distance
-            else:
-                step = np.sign(total_distance) * self.insert_step_size
-                next_progress = commanded_progress + step
-                if abs(next_progress) >= abs(total_distance):
-                    commanded_progress = total_distance
-                else:
-                    commanded_progress = next_progress
+
+            next_gap = max(
+                target_gap,
+                min(insert_start_gap, current_gap) - self.insert_step_size,
+            )
+            next_depth = float(np.clip(insert_start_gap - next_gap, 0.0, total_depth))
+            if next_depth <= commanded_depth and commanded_depth < total_depth:
+                next_depth = float(min(commanded_depth + self.insert_step_size, total_depth))
+            commanded_depth = next_depth
             # The commanded path has constant t1/t2 coordinates and constant
             # orientation. Feedback merely holds those values against tracking
             # drift; the script introduces no new in-plane/rotation command.
-            target_center = insert_start_center + commanded_progress * frame_normal
+            target_center = insert_start_center + commanded_depth * insert_direction
             self._move_attached_object_pose(
-                target_center, insert_start_rotation, 1
+                target_center,
+                insert_start_rotation,
+                self.insert_action_sim_steps,
+                center_feedback_gain=1.0,
+            )
+            inserted_steps += 1
+            self._last_insert_diagnostics["insert_steps"] = int(inserted_steps)
+            self._last_insert_diagnostics["insert_depth"] = float(commanded_depth)
+        else:
+            self._record_insert_failure(
+                last_errors,
+                failure_reason=failure_reason,
+                step_index=max(int(max_steps), 1),
+                depth=commanded_depth,
+                failure_category=failure_category,
             )
         self.insert_success = success
+        if success:
+            self._last_insert_diagnostics.update(
+                {
+                    "failure_reason": "",
+                    "failure_category": "",
+                    "insert_alignment_violation_count": int(alignment_violation_count),
+                    "insert_depth": float(commanded_depth),
+                    "insert_ee_target_error": float(self._last_ee_target_error),
+                }
+            )
         self.stage_tracker.end(
             self._simulation_step_count,
             success=success,
@@ -1009,6 +1230,74 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             and abs(float(errors["yaw_error"])) < self.yaw_tolerance_rad
         )
 
+    def get_insert_alignment_failure_reason(self, errors: Mapping[str, Any]) -> str:
+        ratios = {
+            "insert_error_u_exceeded": abs(float(errors["error_u"]))
+            / self.insert_translation_abort_tolerance,
+            "insert_error_v_exceeded": abs(float(errors["error_v"]))
+            / self.insert_translation_abort_tolerance,
+            "insert_tilt_t1_exceeded": abs(float(errors["tilt_error_t1"]))
+            / self.insert_tilt_abort_tolerance_rad,
+            "insert_tilt_t2_exceeded": abs(float(errors["tilt_error_t2"]))
+            / self.insert_tilt_abort_tolerance_rad,
+            "insert_yaw_exceeded": abs(float(errors["yaw_error"]))
+            / self.insert_yaw_abort_tolerance_rad,
+        }
+        exceeded = {
+            reason: ratio
+            for reason, ratio in ratios.items()
+            if np.isfinite(ratio) and ratio >= 1.0
+        }
+        if not exceeded:
+            return ""
+        return max(exceeded.items(), key=lambda item: item[1])[0]
+
+    def _update_insert_alignment_violation_count(
+        self,
+        errors: Mapping[str, Any],
+        current_count: int,
+    ) -> tuple[int, str]:
+        failure_reason = self.get_insert_alignment_failure_reason(errors)
+        if not failure_reason:
+            return 0, ""
+        next_count = int(current_count) + 1
+        if next_count >= self.insert_alignment_violation_hold_steps:
+            return next_count, failure_reason
+        return next_count, ""
+
+    def _insert_immediate_failure_reason(
+        self,
+        errors: Mapping[str, Any],
+        *,
+        target_center: np.ndarray,
+    ) -> str:
+        scalar_keys = (
+            "error_u",
+            "error_v",
+            "tilt_error_t1",
+            "tilt_error_t2",
+            "yaw_error",
+            "normal_gap_error",
+            "current_normal_gap",
+        )
+        if (
+            not all(np.isfinite(float(errors[key])) for key in scalar_keys)
+            or not np.all(np.isfinite(np.asarray(target_center, dtype=np.float64)))
+        ):
+            return "nan_or_inf"
+        if not self._grasp_weld_is_active():
+            return "suction_weld_broken"
+        if float(np.asarray(errors["glass_center_world"])[2]) < 0.10:
+            return "glass_dropped"
+        collision_reason = self._window_collision_reason()
+        if collision_reason:
+            return collision_reason
+        if self._joint_limit_violated():
+            return "robot_joint_limit"
+        if self._last_ee_target_error > self.unreachable_position_threshold:
+            return "end_effector_unreachable"
+        return ""
+
     # ------------------------------------------------------------------
     # Measurements, diagnostics, and low-level rigid motion
     # ------------------------------------------------------------------
@@ -1053,7 +1342,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         ).astype(np.float32)
 
     def _diagnostic_info(self, errors: Mapping[str, Any]) -> dict[str, Any]:
-        return {
+        info = {
             "error_u": float(errors["error_u"]),
             "error_v": float(errors["error_v"]),
             "tilt_error_t1": float(errors["tilt_error_t1"]),
@@ -1085,6 +1374,22 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
                 self._last_step_gap_diagnostics["normal_gap_correction_magnitude"]
             ),
             "fine_action_sim_steps": int(self.fine_action_sim_steps),
+            "insert_action_sim_steps": int(self.insert_action_sim_steps),
+            "insert_translation_abort_tolerance": float(
+                self.insert_translation_abort_tolerance
+            ),
+            "insert_tilt_abort_tolerance": float(self.insert_tilt_abort_tolerance_rad),
+            "insert_tilt_abort_tolerance_deg": float(
+                np.rad2deg(self.insert_tilt_abort_tolerance_rad)
+            ),
+            "insert_yaw_abort_tolerance": float(self.insert_yaw_abort_tolerance_rad),
+            "insert_yaw_abort_tolerance_deg": float(
+                np.rad2deg(self.insert_yaw_abort_tolerance_rad)
+            ),
+            "insert_alignment_violation_hold_steps": int(
+                self.insert_alignment_violation_hold_steps
+            ),
+            "insert_step_size": float(self.insert_step_size),
             "ee_target_error": float(self._last_ee_target_error),
             "corner_distances": np.asarray(errors["corner_distances"], dtype=np.float64).copy(),
             "glass_center_world": np.asarray(errors["glass_center_world"], dtype=np.float64).copy(),
@@ -1094,6 +1399,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             "stage": self.stage.value,
             "is_attached": bool(self._grasp_weld_is_active()),
         }
+        info.update(self._last_insert_diagnostics)
+        return info
 
     def _move_mocap_pose(
         self, target_position: np.ndarray, target_quaternion: np.ndarray, n_steps: int

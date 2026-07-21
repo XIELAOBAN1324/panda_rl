@@ -32,6 +32,8 @@
       <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
       <body name="window_frame" pos="0.6 0.0 0.5">
+        <camera name="window_front_debug" pos="-0.75 0 0" xyaxes="0 -1 0 0 0 1"/>
+        <camera name="window_side_debug" pos="0 -0.85 0.05" xyaxes="1 0 0 0 0 1"/>
         <geom name="window_frame_top" type="box" size="0.02 0.42 0.075" pos="0 0 0.255" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
         <geom name="window_frame_bottom" type="box" size="0.02 0.42 0.075" pos="0 0 -0.255" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>
         <geom name="window_frame_left" type="box" size="0.02 0.075 0.18" pos="0 -0.345 0" material="window_frame_mat" condim="6" friction="1 0.5 0.5"/>

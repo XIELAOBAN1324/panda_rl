@@ -49,8 +49,8 @@ def test_reset_spaces_seeded_coarse_state_and_no_normal_action():
         assert abs(info_a["error_u"]) <= env.unwrapped.coarse_translation_range
         assert abs(info_a["error_v"]) <= env.unwrapped.coarse_translation_range
         assert info_a["stage"] == "fine_align"
-        assert np.isclose(info_a["reference_normal_gap"], 0.20)
-        assert abs(info_a["current_normal_gap"] - 0.20) <= 0.003
+        assert np.isclose(info_a["reference_normal_gap"], 0.08)
+        assert abs(info_a["current_normal_gap"] - 0.08) <= 0.003
         assert np.isclose(info_a["normal_gap_drift"], info_a["normal_gap_error"])
 
         frame_normal = info_a["frame_normal_world"]
@@ -153,7 +153,7 @@ def test_success_requires_consecutive_steps_then_allows_separate_insert_and_hold
         assert info["success_hold_count"] == base.success_hold_steps
         assert not base.insert_success  # the successful RL step did not insert
         pre_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
-        assert pre_insert_gap > 0.19
+        assert pre_insert_gap > 0.075
         assert base.run_scripted_insert()
         post_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
         assert post_insert_gap < 0.01
@@ -239,8 +239,8 @@ def test_reset_uses_fixed_preinsert_plane_and_keeps_random_inplane_error():
     try:
         for seed in range(30, 40):
             _, info = env.reset(seed=seed)
-            assert abs(info["current_normal_gap"] - 0.20) <= 0.003
-            assert abs(info["measured_initial_normal_gap"] - 0.20) <= 0.003
+            assert abs(info["current_normal_gap"] - 0.08) <= 0.003
+            assert abs(info["measured_initial_normal_gap"] - 0.08) <= 0.003
             assert abs(info["error_u"]) <= env.unwrapped.coarse_translation_range
             assert abs(info["error_v"]) <= env.unwrapped.coarse_translation_range
             inplane_errors.append((round(float(info["error_u"]), 5), round(float(info["error_v"]), 5)))
@@ -344,7 +344,11 @@ def test_random_action_pressure_keeps_normal_gap_failure_near_zero():
     normal_gap_errors = []
     correction_count = 0
     for episode_index in range(20):
-        env = gym.make(ENV_ID, **NO_NOISE)
+        env = gym.make(
+            ENV_ID,
+            normal_gap_correction_threshold=1e-7,
+            **NO_NOISE,
+        )
         try:
             _, info = env.reset(seed=1000 + episode_index)
             normal_gap_errors.append(abs(float(info["normal_gap_error"])))
@@ -376,11 +380,161 @@ def test_fine_alignment_actions_do_not_move_glass_toward_insert_region():
             action = rng.uniform(-1.0, 1.0, size=5).astype(np.float32)
             _, _, terminated, truncated, info = env.step(action)
             min_gap = min(min_gap, float(info["current_normal_gap"]))
-            assert info["current_normal_gap"] > 0.19
+            assert info["current_normal_gap"] > 0.075
             assert not env.unwrapped.insert_success
             if terminated or truncated:
                 break
-        assert min_gap > 0.19
+        assert min_gap > 0.075
         assert env.unwrapped.stage.value == "fine_align"
+    finally:
+        env.close()
+
+
+def _insert_error_dict(**overrides):
+    errors = {
+        "error_u": 0.0,
+        "error_v": 0.0,
+        "tilt_error_t1": 0.0,
+        "tilt_error_t2": 0.0,
+        "yaw_error": 0.0,
+        "normal_gap_error": 0.0,
+        "current_normal_gap": 0.08,
+        "glass_center_world": np.array([0.0, 0.0, 0.2], dtype=np.float64),
+    }
+    errors.update(overrides)
+    return errors
+
+
+def test_insert_abort_tolerance_adds_hysteresis_over_fine_success_threshold():
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        assert not base._within_alignment_tolerance(_insert_error_dict(error_u=0.0021))
+        assert base.get_insert_alignment_failure_reason(
+            _insert_error_dict(error_u=0.0021)
+        ) == ""
+    finally:
+        env.close()
+
+
+def test_insert_alignment_violation_requires_consecutive_steps():
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        count, reason = base._update_insert_alignment_violation_count(
+            _insert_error_dict(error_u=0.0026),
+            0,
+        )
+        assert count == 1
+        assert reason == ""
+
+        count, reason = base._update_insert_alignment_violation_count(
+            _insert_error_dict(error_u=0.0),
+            count,
+        )
+        assert count == 0
+        assert reason == ""
+
+        count, reason = base._update_insert_alignment_violation_count(
+            _insert_error_dict(error_u=0.0026),
+            count,
+        )
+        assert count == 1
+        assert reason == ""
+        count, reason = base._update_insert_alignment_violation_count(
+            _insert_error_dict(error_u=0.0026),
+            count,
+        )
+        assert count == base.insert_alignment_violation_hold_steps
+        assert reason == "insert_error_u_exceeded"
+    finally:
+        env.close()
+
+
+def test_insert_alignment_failure_reason_reports_largest_specific_excess():
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        cases = (
+            ("insert_error_u_exceeded", {"error_u": 0.0030}),
+            ("insert_error_v_exceeded", {"error_v": -0.0030}),
+            (
+                "insert_tilt_t1_exceeded",
+                {"tilt_error_t1": base.insert_tilt_abort_tolerance_rad * 1.2},
+            ),
+            (
+                "insert_tilt_t2_exceeded",
+                {"tilt_error_t2": -base.insert_tilt_abort_tolerance_rad * 1.2},
+            ),
+            (
+                "insert_yaw_exceeded",
+                {"yaw_error": base.insert_yaw_abort_tolerance_rad * 1.2},
+            ),
+            (
+                "insert_yaw_exceeded",
+                {
+                    "error_u": base.insert_translation_abort_tolerance * 1.1,
+                    "yaw_error": base.insert_yaw_abort_tolerance_rad * 1.5,
+                },
+            ),
+        )
+        for expected, overrides in cases:
+            assert base.get_insert_alignment_failure_reason(
+                _insert_error_dict(**overrides)
+            ) == expected
+    finally:
+        env.close()
+
+
+def test_scripted_insert_uses_configured_substeps_feedback_and_monotonic_gap(monkeypatch):
+    env = gym.make(ENV_ID, insert_action_sim_steps=5, hold_steps=5, **NO_NOISE)
+    target_gaps = []
+    call_steps = []
+    feedback_gains = []
+    try:
+        observation, info = env.reset(seed=7)
+        base = env.unwrapped
+        terminated = truncated = False
+        for _ in range(40):
+            observation, _, terminated, truncated, info = env.step(
+                _corrective_action(base, info)
+            )
+            if terminated or truncated:
+                break
+        assert terminated and not truncated
+        assert info["fine_align_success"] and info["ready_for_insert"]
+        pre_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
+        assert abs(pre_insert_gap - base.reference_normal_gap) <= 0.003
+
+        original_move = base._move_attached_object_pose
+
+        def wrapped_move(target_center, target_rotation, n_steps, *, center_feedback_gain=0.0):
+            if base.stage.value == "insert":
+                target_gaps.append(float(base._normal_gap_for_center(target_center)))
+                call_steps.append(int(n_steps))
+                feedback_gains.append(float(center_feedback_gain))
+            return original_move(
+                target_center,
+                target_rotation,
+                n_steps,
+                center_feedback_gain=center_feedback_gain,
+            )
+
+        monkeypatch.setattr(base, "_move_attached_object_pose", wrapped_move)
+        assert base.run_scripted_insert()
+        post_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
+        assert post_insert_gap < 0.01
+        assert target_gaps
+        assert all(step == 5 for step in call_steps)
+        assert all(np.isclose(gain, 1.0) for gain in feedback_gains)
+        assert all(
+            next_gap <= current_gap + 1e-9
+            for current_gap, next_gap in zip(target_gaps, target_gaps[1:])
+        )
+        assert min(target_gaps) <= -base.insert_final_gap + 1e-9
+        diagnostics = base.get_last_insert_diagnostics()
+        assert diagnostics["insert_action_sim_steps"] == 5
+        assert diagnostics["insert_steps"] == len(call_steps)
+        assert diagnostics["failure_reason"] == ""
     finally:
         env.close()

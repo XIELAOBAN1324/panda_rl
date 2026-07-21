@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-translation-range", type=float, default=0.015)
     parser.add_argument("--coarse-tilt-range-deg", type=float, default=2.0)
     parser.add_argument("--coarse-yaw-range-deg", type=float, default=4.0)
-    parser.add_argument("--preinsert-normal-offset", type=float, default=0.20)
+    parser.add_argument("--preinsert-normal-offset", type=float, default=0.08)
     parser.add_argument("--position-action-scale", type=float, default=0.0015)
     parser.add_argument("--tilt-action-scale-deg", type=float, default=0.25)
     parser.add_argument("--yaw-action-scale-deg", type=float, default=0.4)
@@ -61,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normal-gap-correction-threshold", type=float, default=0.0005)
     parser.add_argument("--normal-gap-correction-sim-steps", type=int, default=2)
     parser.add_argument("--max-normal-gap-drift", type=float, default=0.008)
+    parser.add_argument("--insert-action-sim-steps", type=int, default=4)
+    parser.add_argument("--insert-translation-abort-tolerance", type=float, default=0.0025)
+    parser.add_argument("--insert-tilt-abort-tolerance-deg", type=float, default=0.6)
+    parser.add_argument("--insert-yaw-abort-tolerance-deg", type=float, default=0.6)
+    parser.add_argument("--insert-alignment-violation-hold-steps", type=int, default=2)
+    parser.add_argument("--insert-step-size", type=float, default=0.001)
     parser.add_argument("--measurement-noise-translation-std", type=float, default=0.0005)
     parser.add_argument("--measurement-noise-angle-std", type=float, default=0.1)
     parser.add_argument("--eval-measurement-noise-translation-std", type=float, default=None)
@@ -107,6 +113,12 @@ def environment_kwargs(
         "normal_gap_correction_threshold": args.normal_gap_correction_threshold,
         "normal_gap_correction_sim_steps": args.normal_gap_correction_sim_steps,
         "max_normal_gap_drift": args.max_normal_gap_drift,
+        "insert_action_sim_steps": args.insert_action_sim_steps,
+        "insert_translation_abort_tolerance": args.insert_translation_abort_tolerance,
+        "insert_tilt_abort_tolerance_deg": args.insert_tilt_abort_tolerance_deg,
+        "insert_yaw_abort_tolerance_deg": args.insert_yaw_abort_tolerance_deg,
+        "insert_alignment_violation_hold_steps": args.insert_alignment_violation_hold_steps,
+        "insert_step_size": args.insert_step_size,
         "measurement_noise_translation_std": translation_noise,
         "measurement_noise_angle_std_deg": angle_noise,
         "reward_uses_ground_truth": not args.reward_use_noisy_measurement,
@@ -153,14 +165,36 @@ def main() -> None:
     args = parse_args()
     if args.timesteps <= 0 or args.n_envs <= 0:
         raise ValueError("--timesteps and --n-envs must be positive")
-    if args.fine_action_sim_steps <= 0 or args.normal_gap_correction_sim_steps <= 0:
-        raise ValueError("--fine-action-sim-steps and --normal-gap-correction-sim-steps must be positive")
+    if (
+        args.fine_action_sim_steps <= 0
+        or args.normal_gap_correction_sim_steps <= 0
+        or args.insert_action_sim_steps <= 0
+        or args.insert_alignment_violation_hold_steps <= 0
+    ):
+        raise ValueError(
+            "--fine-action-sim-steps, --normal-gap-correction-sim-steps, "
+            "--insert-action-sim-steps and --insert-alignment-violation-hold-steps must be positive"
+        )
     if args.preinsert_normal_offset <= 0.0:
         raise ValueError("--preinsert-normal-offset must be positive")
     if args.normal_gap_correction_threshold < 0.0:
         raise ValueError("--normal-gap-correction-threshold must be non-negative")
     if args.max_normal_gap_drift <= 0.0:
         raise ValueError("--max-normal-gap-drift must be positive")
+    if args.insert_step_size <= 0.0:
+        raise ValueError("--insert-step-size must be positive")
+    if args.insert_translation_abort_tolerance < args.translation_tolerance:
+        raise ValueError(
+            "--insert-translation-abort-tolerance must be at least --translation-tolerance"
+        )
+    if args.insert_tilt_abort_tolerance_deg < args.tilt_tolerance_deg:
+        raise ValueError(
+            "--insert-tilt-abort-tolerance-deg must be at least --tilt-tolerance-deg"
+        )
+    if args.insert_yaw_abort_tolerance_deg < args.yaw_tolerance_deg:
+        raise ValueError(
+            "--insert-yaw-abort-tolerance-deg must be at least --yaw-tolerance-deg"
+        )
 
     random.seed(args.seed)
     np.random.seed(args.seed)

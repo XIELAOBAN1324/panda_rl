@@ -96,6 +96,29 @@ class WindowAssemblyPipeline:
         "normal_gap_error",
         "current_normal_gap",
     )
+    INSERT_START_ERROR_KEYS = (
+        "insert_start_error_u",
+        "insert_start_error_v",
+        "insert_start_tilt_t1",
+        "insert_start_tilt_t2",
+        "insert_start_yaw",
+        "insert_start_normal_gap",
+    )
+    INSERT_MAX_ERROR_KEYS = (
+        "insert_max_abs_error_u",
+        "insert_max_abs_error_v",
+        "insert_max_abs_tilt_t1",
+        "insert_max_abs_tilt_t2",
+        "insert_max_abs_yaw",
+    )
+    INSERT_FAILURE_ERROR_KEYS = (
+        "insert_failure_error_u",
+        "insert_failure_error_v",
+        "insert_failure_tilt_t1",
+        "insert_failure_tilt_t2",
+        "insert_failure_yaw",
+        "insert_failure_normal_gap",
+    )
 
     def __init__(self, env: Any) -> None:
         self.env = env
@@ -157,6 +180,7 @@ class WindowAssemblyPipeline:
             elif not hold_success:
                 failure_reason = self._last_failure_reason("hold_failed")
 
+        insert_diagnostics = self.base.get_last_insert_diagnostics()
         pipeline_end_error_values = self.base.get_fine_alignment_errors()
         pipeline_end_errors = {
             key: float(pipeline_end_error_values[key]) for key in self.ERROR_KEYS
@@ -199,9 +223,50 @@ class WindowAssemblyPipeline:
             "insert_success": insert_success,
             "hold_success": hold_success,
             "full_pipeline_success": bool(fine_success and insert_success and hold_success),
+            "insert_steps": int(insert_diagnostics.get("insert_steps", 0)),
+            "insert_depth": float(insert_diagnostics.get("insert_depth", 0.0)),
+            "insert_start_errors": {
+                key: float(insert_diagnostics.get(key, float("nan")))
+                for key in self.INSERT_START_ERROR_KEYS
+            },
+            "insert_max_errors": {
+                key: float(insert_diagnostics.get(key, float("nan")))
+                for key in self.INSERT_MAX_ERROR_KEYS
+            },
+            "insert_failure_errors": {
+                key: float(insert_diagnostics.get(key, float("nan")))
+                for key in self.INSERT_FAILURE_ERROR_KEYS
+            },
+            "insert_failure_step": int(insert_diagnostics.get("insert_failure_step", -1)),
+            "insert_failure_depth": float(
+                insert_diagnostics.get("insert_failure_depth", float("nan"))
+            ),
+            "insert_alignment_violation_count": int(
+                insert_diagnostics.get("insert_alignment_violation_count", 0)
+            ),
+            "insert_alignment_violation_hold_steps": int(
+                insert_diagnostics.get("insert_alignment_violation_hold_steps", 0)
+            ),
+            "insert_action_sim_steps": int(
+                insert_diagnostics.get("insert_action_sim_steps", 0)
+            ),
+            "insert_translation_abort_tolerance": float(
+                insert_diagnostics.get("insert_translation_abort_tolerance", float("nan"))
+            ),
+            "insert_tilt_abort_tolerance": float(
+                insert_diagnostics.get("insert_tilt_abort_tolerance", float("nan"))
+            ),
+            "insert_yaw_abort_tolerance": float(
+                insert_diagnostics.get("insert_yaw_abort_tolerance", float("nan"))
+            ),
+            "insert_ee_target_error": float(
+                insert_diagnostics.get("insert_ee_target_error", float("nan"))
+            ),
+            "failure_category": str(insert_diagnostics.get("failure_category", "")),
             "terminated": bool(terminated),
             "truncated": bool(truncated),
             "failure_reason": "" if hold_success else (failure_reason or "pipeline_incomplete"),
+            "stage": str(self.base.stage.value),
         }
 
     def _last_failure_reason(self, default: str) -> str:

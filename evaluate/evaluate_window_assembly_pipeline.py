@@ -27,11 +27,17 @@ ENV_ID = "FrankaWindowFineAlignDense-v0"
 ENV_ARG_DEFAULTS = {
     "measurement_noise_translation_std": 0.0,
     "measurement_noise_angle_std": 0.0,
-    "preinsert_normal_offset": 0.20,
+    "preinsert_normal_offset": 0.08,
     "fine_action_sim_steps": 4,
     "normal_gap_correction_threshold": 0.0005,
     "normal_gap_correction_sim_steps": 2,
     "max_normal_gap_drift": 0.008,
+    "insert_action_sim_steps": 4,
+    "insert_translation_abort_tolerance": 0.0025,
+    "insert_tilt_abort_tolerance_deg": 0.6,
+    "insert_yaw_abort_tolerance_deg": 0.6,
+    "insert_alignment_violation_hold_steps": 2,
+    "insert_step_size": 0.001,
 }
 
 ENV_ARG_TO_KWARG = {
@@ -42,6 +48,12 @@ ENV_ARG_TO_KWARG = {
     "normal_gap_correction_threshold": "normal_gap_correction_threshold",
     "normal_gap_correction_sim_steps": "normal_gap_correction_sim_steps",
     "max_normal_gap_drift": "max_normal_gap_drift",
+    "insert_action_sim_steps": "insert_action_sim_steps",
+    "insert_translation_abort_tolerance": "insert_translation_abort_tolerance",
+    "insert_tilt_abort_tolerance_deg": "insert_tilt_abort_tolerance_deg",
+    "insert_yaw_abort_tolerance_deg": "insert_yaw_abort_tolerance_deg",
+    "insert_alignment_violation_hold_steps": "insert_alignment_violation_hold_steps",
+    "insert_step_size": "insert_step_size",
 }
 
 ENV_ARG_FLAGS = {
@@ -52,6 +64,12 @@ ENV_ARG_FLAGS = {
     "normal_gap_correction_threshold": "--normal-gap-correction-threshold",
     "normal_gap_correction_sim_steps": "--normal-gap-correction-sim-steps",
     "max_normal_gap_drift": "--max-normal-gap-drift",
+    "insert_action_sim_steps": "--insert-action-sim-steps",
+    "insert_translation_abort_tolerance": "--insert-translation-abort-tolerance",
+    "insert_tilt_abort_tolerance_deg": "--insert-tilt-abort-tolerance-deg",
+    "insert_yaw_abort_tolerance_deg": "--insert-yaw-abort-tolerance-deg",
+    "insert_alignment_violation_hold_steps": "--insert-alignment-violation-hold-steps",
+    "insert_step_size": "--insert-step-size",
 }
 
 
@@ -68,11 +86,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--measurement-noise-translation-std", type=float, default=0.0)
     parser.add_argument("--measurement-noise-angle-std", type=float, default=0.0)
-    parser.add_argument("--preinsert-normal-offset", type=float, default=0.20)
+    parser.add_argument("--preinsert-normal-offset", type=float, default=0.08)
     parser.add_argument("--fine-action-sim-steps", type=int, default=4)
     parser.add_argument("--normal-gap-correction-threshold", type=float, default=0.0005)
     parser.add_argument("--normal-gap-correction-sim-steps", type=int, default=2)
     parser.add_argument("--max-normal-gap-drift", type=float, default=0.008)
+    parser.add_argument("--insert-action-sim-steps", type=int, default=4)
+    parser.add_argument("--insert-translation-abort-tolerance", type=float, default=0.0025)
+    parser.add_argument("--insert-tilt-abort-tolerance-deg", type=float, default=0.6)
+    parser.add_argument("--insert-yaw-abort-tolerance-deg", type=float, default=0.6)
+    parser.add_argument("--insert-alignment-violation-hold-steps", type=int, default=2)
+    parser.add_argument("--insert-step-size", type=float, default=0.001)
     return parser.parse_args()
 
 
@@ -135,20 +159,101 @@ def load_training_environment_kwargs(model_path: str) -> tuple[dict[str, Any], P
     return dict(train_kwargs), config_path
 
 
-def environment_kwargs(args: argparse.Namespace) -> tuple[dict[str, Any], Path | None]:
+def _values_differ(first: Any, second: Any) -> bool:
+    try:
+        return not bool(np.isclose(float(first), float(second), rtol=0.0, atol=1e-12))
+    except (TypeError, ValueError):
+        return first != second
+
+
+def environment_kwargs(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], Path | None, dict[str, tuple[Any, Any]]]:
     env_kwargs, config_path = load_training_environment_kwargs(args.model)
+    loaded_kwargs = dict(env_kwargs)
     provided = _provided_flags(sys.argv[1:])
+    explicit_overrides: dict[str, tuple[Any, Any]] = {}
     for arg_name, default_value in ENV_ARG_DEFAULTS.items():
         kwarg_name = ENV_ARG_TO_KWARG[arg_name]
-        if ENV_ARG_FLAGS[arg_name] in provided or kwarg_name not in env_kwargs:
-            env_kwargs[kwarg_name] = getattr(args, arg_name, default_value)
-    return env_kwargs, config_path
+        cli_value = getattr(args, arg_name, default_value)
+        if ENV_ARG_FLAGS[arg_name] in provided:
+            if kwarg_name in loaded_kwargs and _values_differ(
+                loaded_kwargs[kwarg_name],
+                cli_value,
+            ):
+                explicit_overrides[kwarg_name] = (loaded_kwargs[kwarg_name], cli_value)
+            env_kwargs[kwarg_name] = cli_value
+        elif kwarg_name not in env_kwargs:
+            env_kwargs[kwarg_name] = cli_value
+    return env_kwargs, config_path, explicit_overrides
+
+
+def validate_environment_kwargs(env_kwargs: dict[str, Any]) -> None:
+    if int(env_kwargs.get("fine_action_sim_steps", 4)) <= 0:
+        raise ValueError("fine_action_sim_steps must be positive")
+    if int(env_kwargs.get("normal_gap_correction_sim_steps", 2)) <= 0:
+        raise ValueError("normal_gap_correction_sim_steps must be positive")
+    if int(env_kwargs.get("insert_action_sim_steps", 4)) <= 0:
+        raise ValueError("insert_action_sim_steps must be positive")
+    if int(env_kwargs.get("insert_alignment_violation_hold_steps", 2)) <= 0:
+        raise ValueError("insert_alignment_violation_hold_steps must be positive")
+    if float(env_kwargs.get("preinsert_normal_offset", 0.08)) <= 0.0:
+        raise ValueError("preinsert_normal_offset must be positive")
+    if float(env_kwargs.get("normal_gap_correction_threshold", 0.0005)) < 0.0:
+        raise ValueError("normal_gap_correction_threshold must be non-negative")
+    if float(env_kwargs.get("max_normal_gap_drift", 0.008)) <= 0.0:
+        raise ValueError("max_normal_gap_drift must be positive")
+    if float(env_kwargs.get("insert_step_size", 0.001)) <= 0.0:
+        raise ValueError("insert_step_size must be positive")
+    translation_tolerance = float(env_kwargs.get("translation_tolerance", 0.002))
+    tilt_tolerance_deg = float(env_kwargs.get("tilt_tolerance_deg", 0.5))
+    yaw_tolerance_deg = float(env_kwargs.get("yaw_tolerance_deg", 0.5))
+    if float(env_kwargs.get("insert_translation_abort_tolerance", 0.0025)) < translation_tolerance:
+        raise ValueError(
+            "insert_translation_abort_tolerance must be at least translation_tolerance"
+        )
+    if float(env_kwargs.get("insert_tilt_abort_tolerance_deg", 0.6)) < tilt_tolerance_deg:
+        raise ValueError(
+            "insert_tilt_abort_tolerance_deg must be at least tilt_tolerance_deg"
+        )
+    if float(env_kwargs.get("insert_yaw_abort_tolerance_deg", 0.6)) < yaw_tolerance_deg:
+        raise ValueError(
+            "insert_yaw_abort_tolerance_deg must be at least yaw_tolerance_deg"
+        )
+
+
+def print_effective_environment_configuration(
+    env_kwargs: dict[str, Any],
+    *,
+    explicit_overrides: dict[str, tuple[Any, Any]],
+) -> None:
+    printed_keys = (
+        "preinsert_normal_offset",
+        "insert_action_sim_steps",
+        "insert_translation_abort_tolerance",
+        "insert_tilt_abort_tolerance_deg",
+        "insert_yaw_abort_tolerance_deg",
+        "insert_alignment_violation_hold_steps",
+        "insert_step_size",
+    )
+    if explicit_overrides:
+        print("Evaluating model with overridden environment configuration.")
+        for key, (old_value, new_value) in sorted(explicit_overrides.items()):
+            print(f"  override {key}: {old_value} -> {new_value}")
+    print("Effective environment configuration:")
+    for key in printed_keys:
+        print(f"  {key}: {env_kwargs.get(key)}")
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     count = max(len(results), 1)
     failures = Counter(
         result["failure_reason"] or "none"
+        for result in results
+        if not result["full_pipeline_success"]
+    )
+    failure_categories = Counter(
+        result["failure_category"] or "none"
         for result in results
         if not result["full_pipeline_success"]
     )
@@ -183,6 +288,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_final_normal_gap_error_m": float(np.mean(final_normal_gap_error)) if results else 0.0,
         "max_final_normal_gap_error_m": float(np.max(final_normal_gap_error)) if results else 0.0,
         "failure_reason_counts": dict(sorted(failures.items())),
+        "failure_category_counts": dict(sorted(failure_categories.items())),
     }
 
 
@@ -190,14 +296,24 @@ def main() -> None:
     args = parse_args()
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
-    if args.fine_action_sim_steps <= 0 or args.normal_gap_correction_sim_steps <= 0:
-        raise ValueError("--fine-action-sim-steps and --normal-gap-correction-sim-steps must be positive")
+    if (
+        args.fine_action_sim_steps <= 0
+        or args.normal_gap_correction_sim_steps <= 0
+        or args.insert_action_sim_steps <= 0
+        or args.insert_alignment_violation_hold_steps <= 0
+    ):
+        raise ValueError(
+            "--fine-action-sim-steps, --normal-gap-correction-sim-steps, "
+            "--insert-action-sim-steps and --insert-alignment-violation-hold-steps must be positive"
+        )
     if args.preinsert_normal_offset <= 0.0:
         raise ValueError("--preinsert-normal-offset must be positive")
     if args.normal_gap_correction_threshold < 0.0:
         raise ValueError("--normal-gap-correction-threshold must be non-negative")
     if args.max_normal_gap_drift <= 0.0:
         raise ValueError("--max-normal-gap-drift must be positive")
+    if args.insert_step_size <= 0.0:
+        raise ValueError("--insert-step-size must be positive")
     output_dir = Path(
         args.output_dir
         or Path("outputs")
@@ -205,7 +321,12 @@ def main() -> None:
         / datetime.now().strftime("%Y%m%d-%H%M%S")
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    env_kwargs, training_config_path = environment_kwargs(args)
+    env_kwargs, training_config_path, explicit_overrides = environment_kwargs(args)
+    validate_environment_kwargs(env_kwargs)
+    print_effective_environment_configuration(
+        env_kwargs,
+        explicit_overrides=explicit_overrides,
+    )
     render_mode = "rgb_array" if args.record_video else ("human" if args.render else None)
     env = gym.make(
         ENV_ID,
@@ -237,10 +358,18 @@ def main() -> None:
             results.append(result)
             if collector is not None:
                 collector.save()
+            insert_start_errors = result.get("insert_start_errors", {})
+            insert_max_errors = result.get("insert_max_errors", {})
             print(
                 f"episode={episode_index} fine={result['fine_align_success']} "
                 f"insert={result['insert_success']} hold={result['hold_success']} "
-                f"steps={result['fine_align_steps']} failure={result['failure_reason'] or 'none'}"
+                f"full={result['full_pipeline_success']} "
+                f"fine_steps={result['fine_align_steps']} insert_steps={result['insert_steps']} "
+                f"stage={result['stage']} "
+                f"start_errors={insert_start_errors} max_errors={insert_max_errors} "
+                f"insert_depth={result['insert_depth']:.4f} "
+                f"failure={result['failure_reason'] or 'none'} "
+                f"category={result['failure_category'] or 'none'}"
             )
     finally:
         env.close()
