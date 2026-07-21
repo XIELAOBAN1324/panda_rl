@@ -76,6 +76,7 @@ def print_pickplace_sparse_effective_config(config: SACConfig) -> None:
     print(f"  residual_guidance: {getattr(config, 'residual_guidance', False)}")
     print(f"  residual_action_scale: {getattr(config, 'residual_action_scale', 0.1)}")
     print(f"  expert_demo_episodes: {getattr(config, 'expert_demo_episodes', 0)}")
+    print(f"  expert_warmstart_only: {getattr(config, 'expert_warmstart_only', False)}")
     print(f"  expert_demo_style: {getattr(config, 'expert_demo_style', 'staged')}")
     print(f"  expert_hint_style: {getattr(config, 'expert_hint_style', 'staged')}")
     print(f"  bc_pretrain_epochs: {getattr(config, 'bc_pretrain_epochs', 0)}")
@@ -124,6 +125,27 @@ def is_window_prealign_env(env_name: str) -> bool:
     return "PickAndPlaceWindowPrealign" in env_name
 
 
+def validate_expert_runtime_config(
+    *,
+    env_name: str,
+    expert_warmstart_only: bool,
+    task_progress_features: bool,
+    residual_guidance: bool,
+) -> None:
+    if not (expert_warmstart_only and is_pick_and_place_sparse(env_name)):
+        return
+    if residual_guidance:
+        raise ValueError(
+            "expert_warmstart_only=True is incompatible with residual_guidance=True: "
+            "residual policy execution requires online expert hints."
+        )
+    if task_progress_features:
+        raise ValueError(
+            "expert_warmstart_only=True is incompatible with task_progress_features=True: "
+            "task progress observations include expert hint actions at runtime."
+        )
+
+
 def create_env(
     env_name,
     render_mode=None,
@@ -137,9 +159,16 @@ def create_env(
     expert_hint_style: str = "staged",
     residual_guidance: bool = False,
     residual_action_scale: float = 0.1,
+    expert_warmstart_only: bool = False,
     safe_curriculum: bool = False,
     safe_curriculum_total_env_steps: Optional[int] = None,
 ):
+    validate_expert_runtime_config(
+        env_name=env_name,
+        expert_warmstart_only=expert_warmstart_only,
+        task_progress_features=task_progress_features,
+        residual_guidance=residual_guidance,
+    )
     env = gym.make(env_name, render_mode=render_mode)
 
     if safe_curriculum and is_pick_and_place_sparse(env_name):
@@ -192,6 +221,7 @@ def create_vec_env(
     expert_hint_style: str = "staged",
     residual_guidance: bool = False,
     residual_action_scale: float = 0.1,
+    expert_warmstart_only: bool = False,
     safe_curriculum: bool = False,
     safe_curriculum_total_env_steps: Optional[int] = None,
 ):
@@ -210,6 +240,7 @@ def create_vec_env(
                 expert_hint_style=expert_hint_style,
                 residual_guidance=residual_guidance,
                 residual_action_scale=residual_action_scale,
+                expert_warmstart_only=expert_warmstart_only,
                 safe_curriculum=safe_curriculum,
                 safe_curriculum_total_env_steps=safe_curriculum_total_env_steps,
             )
@@ -324,6 +355,7 @@ def collect_pickplace_demos_for_training(config: SACConfig) -> Optional[ExpertDa
             expert_hint_style=getattr(config, "expert_hint_style", "staged"),
             residual_guidance=False,
             residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            expert_warmstart_only=False,
             safe_curriculum=False,
         )
 
@@ -458,6 +490,7 @@ def evaluate_manual_any_success(model, config: SACConfig, episodes: int = 10, se
             task_progress_features=getattr(config, "task_progress_features", False),
             residual_guidance=getattr(config, "residual_guidance", False),
             residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            expert_warmstart_only=getattr(config, "expert_warmstart_only", False),
             safe_curriculum=False,
         )
         observation, _ = env.reset(seed=seed_start + episode_idx)
@@ -512,6 +545,12 @@ def _save_summary(summary, *paths):
 
 def train_sac(config: SACConfig):
     configure_runtime(config)
+    validate_expert_runtime_config(
+        env_name=config.env_name,
+        expert_warmstart_only=bool(getattr(config, "expert_warmstart_only", False)),
+        task_progress_features=bool(getattr(config, "task_progress_features", False)),
+        residual_guidance=bool(getattr(config, "residual_guidance", False)),
+    )
     if (
         bool(getattr(config, "her", False))
         and bool(getattr(config, "dense_reward_shaping", False))
@@ -550,6 +589,7 @@ def train_sac(config: SACConfig):
         expert_hint_style=getattr(config, "expert_hint_style", "staged"),
         residual_guidance=getattr(config, "residual_guidance", False),
         residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+        expert_warmstart_only=getattr(config, "expert_warmstart_only", False),
         safe_curriculum=config.safe_curriculum,
         safe_curriculum_total_env_steps=max(config.total_timesteps // max(config.n_envs, 1), 1),
     )
@@ -571,6 +611,7 @@ def train_sac(config: SACConfig):
             expert_hint_style=getattr(config, "expert_hint_style", "staged"),
             residual_guidance=getattr(config, "residual_guidance", False),
             residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            expert_warmstart_only=getattr(config, "expert_warmstart_only", False),
             safe_curriculum=False,
         )
         if isinstance(eval_env, VecNormalize):
@@ -677,6 +718,7 @@ def train_sac(config: SACConfig):
             expert_hint_style=getattr(config, "expert_hint_style", "staged"),
             residual_guidance=getattr(config, "residual_guidance", False),
             residual_action_scale=getattr(config, "residual_action_scale", 0.1),
+            expert_warmstart_only=getattr(config, "expert_warmstart_only", False),
             safe_curriculum=False,
         )
         if isinstance(eval_env, VecNormalize):
@@ -755,6 +797,8 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
             config.task_progress_features = False
         if getattr(args, "residual_guidance", None) is None:
             config.residual_guidance = False
+        if getattr(args, "expert_warmstart_only", False):
+            config.expert_warmstart_only = True
         if args.normalize_env is None:
             config.normalize_env = False
         if config.dense_reward_shaping:
@@ -820,6 +864,8 @@ def apply_pickplace_sparse_defaults(config: SACConfig, args) -> SACConfig:
             config.task_progress_features = False
         if getattr(args, "residual_guidance", None) is None:
             config.residual_guidance = False
+        if getattr(args, "expert_warmstart_only", False):
+            config.expert_warmstart_only = True
         if args.normalize_env is None:
             config.normalize_env = False
         if config.dense_reward_shaping:
@@ -1060,6 +1106,11 @@ def main():
     parser.add_argument("--bc-epochs", type=int, default=0, help="使用 expert demo 进行 actor behavior cloning 预训练的 epoch 数")
     parser.add_argument("--bc-batch-size", type=int, default=512, help="behavior cloning batch size")
     parser.add_argument("--bc-learning-rate", type=float, default=None, help="behavior cloning learning rate")
+    parser.add_argument(
+        "--expert-warmstart-only",
+        action="store_true",
+        help="只允许 expert 用于 demo/BC/replay warm-start，禁止运行时 expert hint / residual guidance",
+    )
     parser.add_argument("--no-demo-prefill", action="store_true", help="禁用 expert demo replay buffer 预填充")
     parser.add_argument("--demo-prefill-passes", type=int, default=1, help="expert demo replay buffer 的重复装载次数")
     parser.set_defaults(dense_reward_shaping=None)
@@ -1148,6 +1199,7 @@ def main():
         residual_guidance=False if args.residual_guidance is None else args.residual_guidance,
         residual_action_scale=args.residual_action_scale,
         init_model_path=args.init_model_path,
+        expert_warmstart_only=args.expert_warmstart_only,
         expert_demo_episodes=args.expert_demo_episodes,
         expert_demo_style=args.expert_demo_style or "staged",
         expert_hint_style=args.expert_hint_style or "staged",

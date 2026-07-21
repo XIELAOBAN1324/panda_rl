@@ -147,6 +147,7 @@ class SACConfig(BaseConfig):
 
     # 可选 warm-start
     init_model_path: Optional[str] = None
+    expert_warmstart_only: bool = False
     expert_demo_episodes: int = 0
     expert_demo_style: str = "staged"
     expert_hint_style: str = "staged"

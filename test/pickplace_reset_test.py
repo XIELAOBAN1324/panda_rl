@@ -1,12 +1,13 @@
 import gymnasium as gym
 import numpy as np
+import pytest
 
 import panda_mujoco_gym  # noqa: F401
 from evaluate.evaluate_with_video import _episode_failure_reasons, _write_summary
 from train.common.expert_pickplace import collect_pickplace_expert_dataset
 from train.common.config import SACConfig
 from train.common.wrappers import PickAndPlaceDenseRewardWrapper
-from train.train_sac import apply_pickplace_sparse_defaults
+from train.train_sac import apply_pickplace_sparse_defaults, validate_expert_runtime_config
 
 
 def _collect_goal_distances(env, num_resets: int = 64):
@@ -15,6 +16,38 @@ def _collect_goal_distances(env, num_resets: int = 64):
         obs, _ = env.reset(seed=seed)
         distances.append(float(np.linalg.norm(obs["achieved_goal"][:3] - obs["desired_goal"][:3])))
     return distances
+
+
+def _insert_reward_info(
+    *,
+    collision=False,
+    plane_violation=False,
+    glass_fits_window=True,
+    inplane_alignment=1.0,
+    orientation_alignment=1.0,
+    fit_margin=0.02,
+    insert_depth=1.0,
+    inplane_offset=0.0,
+    prealign_distance=0.0,
+    preinsert_distance=0.0,
+    final_insert_distance=0.0,
+    reward_stage_id=1,
+):
+    return {
+        "collision": collision,
+        "plane_violation": plane_violation,
+        "glass_fits_window": glass_fits_window,
+        "inplane_alignment": inplane_alignment,
+        "orientation_alignment": orientation_alignment,
+        "fit_margin": fit_margin,
+        "insert_depth": insert_depth,
+        "inplane_offset": inplane_offset,
+        "prealign_distance": prealign_distance,
+        "preinsert_distance": preinsert_distance,
+        "final_insert_distance": final_insert_distance,
+        "reward_stage_id": reward_stage_id,
+        "reward_stage": "insert" if reward_stage_id else "align",
+    }
 
 
 def test_pickplace_window_sparse_reset_avoids_immediate_success():
@@ -126,6 +159,27 @@ def test_pickplace_window_insert_reset_starts_attached_and_lifted():
             assert -60.0 <= angle <= 0.0
             assert base._max_object_penetration() <= base.plane_constraint_eps + 1e-9
             assert not base._has_window_collision()
+    finally:
+        env.close()
+
+
+def test_pickplace_window_insert_step_reports_continuous_reward_metrics():
+    env = gym.make("FrankaPickAndPlaceWindowInsertSparse-v0")
+    try:
+        env.reset(seed=0)
+        _, _, _, _, info = env.step(np.zeros(env.action_space.shape, dtype=np.float32))
+        assert "fit_margin" in info
+        assert "insert_depth" in info
+        assert "inplane_offset" in info
+        assert "reward_stage" in info
+        assert "reward_stage_id" in info
+        assert "prealign_distance" in info
+        assert "preinsert_distance" in info
+        assert "final_insert_distance" in info
+        assert isinstance(info["reward_stage"], str)
+        assert int(info["reward_stage_id"]) in {0, 1}
+        assert np.isfinite(float(info["fit_margin"]))
+        assert 0.0 <= float(info["insert_depth"]) <= 1.0
     finally:
         env.close()
 
@@ -312,6 +366,7 @@ def test_apply_pickplace_sparse_defaults_for_window_prealign_and_insert():
         expert_demo_episodes = 0
         expert_demo_style = None
         expert_hint_style = None
+        expert_warmstart_only = False
         demo_prefill_passes = 1
         safe_curriculum = None
         pickplace_profile = "auto"
@@ -339,9 +394,28 @@ def test_apply_pickplace_sparse_defaults_for_window_prealign_and_insert():
     assert insert_config.dense_reward_shaping is True
     assert insert_config.dense_reward_style == "insert"
     assert insert_config.task_geometry_features is True
+    assert insert_config.task_progress_features is False
     assert insert_config.residual_guidance is False
     assert insert_config.normalize_env is False
     assert insert_config.n_envs == 1
+
+
+def test_expert_warmstart_only_rejects_runtime_expert_features():
+    with pytest.raises(ValueError, match="task_progress_features"):
+        validate_expert_runtime_config(
+            env_name="FrankaPickAndPlaceWindowInsertSparse-v0",
+            expert_warmstart_only=True,
+            task_progress_features=True,
+            residual_guidance=False,
+        )
+
+    with pytest.raises(ValueError, match="residual_guidance"):
+        validate_expert_runtime_config(
+            env_name="FrankaPickAndPlaceWindowInsertSparse-v0",
+            expert_warmstart_only=True,
+            task_progress_features=False,
+            residual_guidance=True,
+        )
 
 
 def test_pickplace_window_insert_dense_reward_penalizes_collision():
@@ -350,16 +424,8 @@ def test_pickplace_window_insert_dense_reward_penalizes_collision():
     try:
         env.reset(seed=0)
         desired_goal = base.goal.copy()
-        good_info = {
-            "collision": False,
-            "plane_violation": False,
-            "glass_fits_window": True,
-        }
-        bad_info = {
-            "collision": True,
-            "plane_violation": False,
-            "glass_fits_window": False,
-        }
+        good_info = _insert_reward_info()
+        bad_info = _insert_reward_info(collision=True, glass_fits_window=False, fit_margin=-0.02)
         good_reward = float(base.compute_reward(desired_goal, desired_goal, good_info))
         bad_reward = float(base.compute_reward(desired_goal, desired_goal, bad_info))
 
@@ -374,18 +440,8 @@ def test_pickplace_window_insert_dense_reward_penalizes_inplane_misalignment():
     try:
         env.reset(seed=0)
         desired_goal = base.goal.copy()
-        good_info = {
-            "collision": False,
-            "plane_violation": False,
-            "glass_fits_window": True,
-            "inplane_alignment": 1.0,
-        }
-        bad_info = {
-            "collision": False,
-            "plane_violation": False,
-            "glass_fits_window": True,
-            "inplane_alignment": 0.0,
-        }
+        good_info = _insert_reward_info()
+        bad_info = _insert_reward_info(inplane_alignment=0.0, fit_margin=-0.01, inplane_offset=0.06, reward_stage_id=0)
         good_reward = float(base.compute_reward(desired_goal, desired_goal, good_info))
         bad_reward = float(base.compute_reward(desired_goal, desired_goal, bad_info))
 
@@ -404,24 +460,14 @@ def test_pickplace_insert_shaping_penalizes_inplane_misalignment():
             env.compute_reward(
                 achieved_goal,
                 desired_goal,
-                {
-                    "collision": False,
-                    "plane_violation": False,
-                    "glass_fits_window": True,
-                    "inplane_alignment": 1.0,
-                },
+                _insert_reward_info(),
             )
         )
         bad_reward = float(
             env.compute_reward(
                 achieved_goal,
                 desired_goal,
-                {
-                    "collision": False,
-                    "plane_violation": False,
-                    "glass_fits_window": True,
-                    "inplane_alignment": 0.0,
-                },
+                _insert_reward_info(inplane_alignment=0.0, fit_margin=-0.01, inplane_offset=0.06, reward_stage_id=0),
             )
         )
 
@@ -440,28 +486,18 @@ def test_pickplace_insert_shaping_requires_glass_fit_info():
             env.compute_reward(
                 achieved_goal,
                 desired_goal,
-                {
-                    "collision": False,
-                    "plane_violation": False,
-                    "glass_fits_window": False,
-                    "inplane_alignment": 1.0,
-                },
+                _insert_reward_info(glass_fits_window=False, fit_margin=-0.02, reward_stage_id=0),
             )
         )
         true_fit_reward = float(
             env.compute_reward(
                 achieved_goal,
                 desired_goal,
-                {
-                    "collision": False,
-                    "plane_violation": False,
-                    "glass_fits_window": True,
-                    "inplane_alignment": 1.0,
-                },
+                _insert_reward_info(),
             )
         )
 
-        assert false_fit_reward < true_fit_reward - 0.4
+        assert false_fit_reward < true_fit_reward - 0.2
         assert false_fit_reward <= 0.0
     finally:
         env.close()
@@ -477,36 +513,21 @@ def test_pickplace_insert_shaping_penalizes_collision_and_plane_violation():
             env.compute_reward(
                 achieved_goal,
                 desired_goal,
-                {
-                    "collision": False,
-                    "plane_violation": False,
-                    "glass_fits_window": True,
-                    "inplane_alignment": 1.0,
-                },
+                _insert_reward_info(),
             )
         )
         collision_reward = float(
             env.compute_reward(
                 achieved_goal,
                 desired_goal,
-                {
-                    "collision": True,
-                    "plane_violation": False,
-                    "glass_fits_window": True,
-                    "inplane_alignment": 1.0,
-                },
+                _insert_reward_info(collision=True),
             )
         )
         plane_reward = float(
             env.compute_reward(
                 achieved_goal,
                 desired_goal,
-                {
-                    "collision": False,
-                    "plane_violation": True,
-                    "glass_fits_window": True,
-                    "inplane_alignment": 1.0,
-                },
+                _insert_reward_info(plane_violation=True),
             )
         )
 
@@ -525,18 +546,8 @@ def test_pickplace_insert_dense_env_and_wrapper_reward_ordering_match():
         wrapper_env.reset(seed=0)
         achieved_goal = dense_env.unwrapped.goal.copy()
         desired_goal = dense_env.unwrapped.goal.copy()
-        clean_info = {
-            "collision": False,
-            "plane_violation": False,
-            "glass_fits_window": True,
-            "inplane_alignment": 1.0,
-        }
-        bad_info = {
-            "collision": False,
-            "plane_violation": False,
-            "glass_fits_window": False,
-            "inplane_alignment": 1.0,
-        }
+        clean_info = _insert_reward_info()
+        bad_info = _insert_reward_info(glass_fits_window=False, fit_margin=-0.02, reward_stage_id=0)
 
         dense_clean = float(dense_env.unwrapped.compute_reward(achieved_goal, desired_goal, clean_info))
         dense_bad = float(dense_env.unwrapped.compute_reward(achieved_goal, desired_goal, bad_info))
@@ -549,6 +560,230 @@ def test_pickplace_insert_dense_env_and_wrapper_reward_ordering_match():
     finally:
         dense_env.close()
         wrapper_env.close()
+
+
+def test_pickplace_insert_reward_prefers_true_insert_over_single_side_jam():
+    env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        env.reset(seed=0)
+        achieved_goal = env.unwrapped.goal.copy()
+        desired_goal = env.unwrapped.goal.copy()
+        true_insert_reward = float(env.compute_reward(achieved_goal, desired_goal, _insert_reward_info()))
+        jam_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    glass_fits_window=False,
+                    fit_margin=-0.018,
+                    insert_depth=0.85,
+                    inplane_offset=0.035,
+                    preinsert_distance=0.01,
+                    final_insert_distance=0.012,
+                    reward_stage_id=0,
+                ),
+            )
+        )
+        assert true_insert_reward > jam_reward + 0.2
+    finally:
+        env.close()
+
+
+def test_pickplace_insert_reward_penalizes_unaligned_forward_push():
+    env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        env.reset(seed=0)
+        achieved_goal = env.unwrapped.goal.copy()
+        desired_goal = env.unwrapped.goal.copy()
+        cautious_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    glass_fits_window=False,
+                    fit_margin=-0.01,
+                    insert_depth=0.05,
+                    inplane_offset=0.03,
+                    prealign_distance=0.03,
+                    preinsert_distance=0.05,
+                    reward_stage_id=0,
+                ),
+            )
+        )
+        push_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    glass_fits_window=False,
+                    fit_margin=-0.01,
+                    insert_depth=0.85,
+                    inplane_offset=0.03,
+                    prealign_distance=0.03,
+                    preinsert_distance=0.05,
+                    reward_stage_id=0,
+                ),
+            )
+        )
+        assert cautious_reward > push_reward + 0.1
+    finally:
+        env.close()
+
+
+def test_pickplace_insert_reward_increases_with_insert_depth_when_aligned():
+    env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        env.reset(seed=0)
+        achieved_goal = env.unwrapped.goal.copy()
+        desired_goal = env.unwrapped.goal.copy()
+        shallow_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    fit_margin=0.01,
+                    insert_depth=0.2,
+                    final_insert_distance=0.012,
+                    reward_stage_id=1,
+                ),
+            )
+        )
+        deep_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    fit_margin=0.02,
+                    insert_depth=0.9,
+                    final_insert_distance=0.002,
+                    reward_stage_id=1,
+                ),
+            )
+        )
+        assert deep_reward > shallow_reward + 0.1
+    finally:
+        env.close()
+
+
+def test_pickplace_insert_reward_improves_monotonically_with_fit_margin():
+    env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        env.reset(seed=0)
+        achieved_goal = env.unwrapped.goal.copy()
+        desired_goal = env.unwrapped.goal.copy()
+        far_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(glass_fits_window=False, fit_margin=-0.02, inplane_offset=0.04, reward_stage_id=0),
+            )
+        )
+        near_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(glass_fits_window=False, fit_margin=-0.002, inplane_offset=0.02, reward_stage_id=0),
+            )
+        )
+        fit_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(glass_fits_window=True, fit_margin=0.015, inplane_offset=0.0, reward_stage_id=1),
+            )
+        )
+        assert near_reward > far_reward
+        assert fit_reward > near_reward
+    finally:
+        env.close()
+
+
+def test_pickplace_insert_reward_penalizes_high_alignment_without_fit():
+    env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        env.reset(seed=0)
+        achieved_goal = env.unwrapped.goal.copy()
+        desired_goal = env.unwrapped.goal.copy()
+        no_fit_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    glass_fits_window=False,
+                    orientation_alignment=0.999,
+                    inplane_alignment=0.999,
+                    fit_margin=-0.03,
+                    insert_depth=0.0,
+                    inplane_offset=0.035,
+                    prealign_distance=0.01,
+                    preinsert_distance=0.02,
+                    reward_stage_id=0,
+                ),
+            )
+        )
+        near_fit_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    glass_fits_window=False,
+                    orientation_alignment=0.999,
+                    inplane_alignment=0.999,
+                    fit_margin=-0.002,
+                    insert_depth=0.1,
+                    inplane_offset=0.01,
+                    prealign_distance=0.01,
+                    preinsert_distance=0.01,
+                    reward_stage_id=1,
+                ),
+            )
+        )
+        assert near_fit_reward > no_fit_reward + 0.1
+    finally:
+        env.close()
+
+
+def test_pickplace_insert_reward_prefers_progress_toward_window_waypoints():
+    env = PickAndPlaceDenseRewardWrapper(gym.make("FrankaPickAndPlaceWindowInsertSparse-v0"), reward_style="insert")
+    try:
+        env.reset(seed=0)
+        achieved_goal = env.unwrapped.goal.copy()
+        desired_goal = env.unwrapped.goal.copy()
+        far_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    glass_fits_window=False,
+                    orientation_alignment=0.9,
+                    inplane_alignment=0.9,
+                    fit_margin=-1.0,
+                    inplane_offset=0.25,
+                    prealign_distance=0.20,
+                    preinsert_distance=0.16,
+                    reward_stage_id=0,
+                ),
+            )
+        )
+        near_reward = float(
+            env.compute_reward(
+                achieved_goal,
+                desired_goal,
+                _insert_reward_info(
+                    glass_fits_window=False,
+                    orientation_alignment=0.95,
+                    inplane_alignment=0.95,
+                    fit_margin=-0.08,
+                    inplane_offset=0.05,
+                    prealign_distance=0.05,
+                    preinsert_distance=0.03,
+                    reward_stage_id=0,
+                ),
+            )
+        )
+        assert near_reward > far_reward + 0.1
+    finally:
+        env.close()
 
 
 def test_evaluate_failure_reasons_mark_lost_success():

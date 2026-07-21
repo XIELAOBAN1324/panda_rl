@@ -54,3 +54,27 @@ for reward_type in ["sparse", "dense"]:
         max_episode_steps=200,
     )
     ENV_IDS.append(prealign_env_id)
+
+
+FINE_ALIGN_ENV_ID = "FrankaWindowFineAlignDense-v0"
+register(
+    id=FINE_ALIGN_ENV_ID,
+    entry_point="panda_mujoco_gym.envs:FrankaWindowFineAlignEnv",
+    kwargs={
+        "reward_type": "dense",
+        "max_episode_steps": 100,
+        "coarse_translation_range": 0.015,
+        "coarse_tilt_range_deg": 2.0,
+        "coarse_yaw_range_deg": 4.0,
+        "fine_position_action_scale": 0.0015,
+        "fine_tilt_action_scale_deg": 0.25,
+        "fine_yaw_action_scale_deg": 0.4,
+        "translation_tolerance": 0.002,
+        "tilt_tolerance_deg": 0.5,
+        "yaw_tolerance_deg": 0.5,
+        "normal_gap_tolerance": 0.001,
+        "success_hold_steps": 5,
+    },
+    max_episode_steps=100,
+)
+ENV_IDS.append(FINE_ALIGN_ENV_ID)

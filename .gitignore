@@ -6,4 +6,5 @@ __pycache__/
 # Ignore output and lower file
 outputs/
 fix.txt
-franka_description/
+franka_description//robust-rearrangement/
+/franka_description/

@@ -36,6 +36,10 @@ class TrainingCallback(BaseCallback):
         self.recent_inplane_alignments = deque(maxlen=100)
         self.recent_pose_alignments = deque(maxlen=100)
         self.recent_glass_fits = deque(maxlen=100)
+        self.recent_fit_margins = deque(maxlen=100)
+        self.recent_insert_depths = deque(maxlen=100)
+        self.recent_inplane_offsets = deque(maxlen=100)
+        self.recent_reward_stage_ids = deque(maxlen=100)
         self.recent_success_rate = 0.0
         self.recent_any_success_rate = 0.0
         self.recent_lost_success_rate = 0.0
@@ -46,6 +50,10 @@ class TrainingCallback(BaseCallback):
         self.recent_inplane_alignment = 0.0
         self.recent_pose_alignment = 0.0
         self.recent_glass_fits_rate = 0.0
+        self.recent_fit_margin = 0.0
+        self.recent_insert_depth = 0.0
+        self.recent_inplane_offset = 0.0
+        self.recent_insert_stage_rate = 0.0
 
         self.saved_stages = set()
         self.stage_timesteps = config.get_stage_timesteps()
@@ -61,9 +69,11 @@ class TrainingCallback(BaseCallback):
                 "Success", "Any_Success", "Lost_Success", "Success_Rate", "Any_Success_Rate", "Lost_Success_Rate",
                 "Collision", "Plane_Violation", "Position_Error",
                 "Orientation_Alignment", "Inplane_Alignment", "Pose_Alignment", "Glass_Fits_Window",
+                "Fit_Margin", "Insert_Depth", "Inplane_Offset", "Reward_Stage",
                 "Collision_Rate", "Plane_Violation_Rate", "Recent_Position_Error",
                 "Recent_Orientation_Alignment", "Recent_Inplane_Alignment", "Recent_Pose_Alignment",
-                "Glass_Fits_Rate", "Terminal_Failure_Reason",
+                "Glass_Fits_Rate", "Recent_Fit_Margin", "Recent_Insert_Depth", "Recent_Inplane_Offset",
+                "Insert_Stage_Rate", "Terminal_Failure_Reason",
                 "Best_Reward", "Stage", "Curriculum_Stage", "Curriculum_Progress", "Env_Index"
             ])
 
@@ -148,6 +158,10 @@ class TrainingCallback(BaseCallback):
         inplane_alignment = float(info.get("inplane_alignment", np.nan))
         pose_alignment = float(info.get("pose_alignment", np.nan))
         glass_fits_window = bool(info.get("glass_fits_window", False))
+        fit_margin = float(info.get("fit_margin", np.nan))
+        insert_depth = float(info.get("insert_depth", np.nan))
+        inplane_offset = float(info.get("inplane_offset", np.nan))
+        reward_stage_id = int(info.get("reward_stage_id", 0))
 
         self.episode_rewards.append(episode_reward)
         self.episode_lengths.append(episode_length)
@@ -166,6 +180,13 @@ class TrainingCallback(BaseCallback):
         if np.isfinite(pose_alignment):
             self.recent_pose_alignments.append(pose_alignment)
         self.recent_glass_fits.append(int(glass_fits_window))
+        if np.isfinite(fit_margin):
+            self.recent_fit_margins.append(fit_margin)
+        if np.isfinite(insert_depth):
+            self.recent_insert_depths.append(insert_depth)
+        if np.isfinite(inplane_offset):
+            self.recent_inplane_offsets.append(inplane_offset)
+        self.recent_reward_stage_ids.append(reward_stage_id)
         self.episode_count += 1
 
         if is_success:
@@ -201,6 +222,18 @@ class TrainingCallback(BaseCallback):
         self.recent_glass_fits_rate = (
             float(np.mean(self.recent_glass_fits)) if self.recent_glass_fits else 0.0
         )
+        self.recent_fit_margin = (
+            float(np.mean(self.recent_fit_margins)) if self.recent_fit_margins else 0.0
+        )
+        self.recent_insert_depth = (
+            float(np.mean(self.recent_insert_depths)) if self.recent_insert_depths else 0.0
+        )
+        self.recent_inplane_offset = (
+            float(np.mean(self.recent_inplane_offsets)) if self.recent_inplane_offsets else 0.0
+        )
+        self.recent_insert_stage_rate = (
+            float(np.mean(self.recent_reward_stage_ids)) if self.recent_reward_stage_ids else 0.0
+        )
 
         if episode_reward > self.best_reward:
             self.best_reward = episode_reward
@@ -222,6 +255,10 @@ class TrainingCallback(BaseCallback):
         self.logger.record("rollout/inplane_alignment", self.recent_inplane_alignment)
         self.logger.record("rollout/pose_alignment", self.recent_pose_alignment)
         self.logger.record("rollout/glass_fits_rate", self.recent_glass_fits_rate)
+        self.logger.record("rollout/fit_margin", self.recent_fit_margin)
+        self.logger.record("rollout/insert_depth", self.recent_insert_depth)
+        self.logger.record("rollout/inplane_offset", self.recent_inplane_offset)
+        self.logger.record("rollout/insert_stage_rate", self.recent_insert_stage_rate)
         self._save_to_csv(
             episode_reward,
             episode_length,
@@ -268,7 +305,11 @@ class TrainingCallback(BaseCallback):
             f"Align: {self.recent_orientation_alignment:.3f} | "
             f"InPlane: {self.recent_inplane_alignment:.3f} | "
             f"PoseAlign: {self.recent_pose_alignment:.3f} | "
-            f"Fits: {self.recent_glass_fits_rate:.3f}"
+            f"Fits: {self.recent_glass_fits_rate:.3f} | "
+            f"FitMargin: {self.recent_fit_margin:.4f} | "
+            f"Depth: {self.recent_insert_depth:.3f} | "
+            f"InPlaneOff: {self.recent_inplane_offset:.4f} | "
+            f"InsertStage: {self.recent_insert_stage_rate:.3f}"
         )
 
     def _save_to_csv(self, episode_reward, episode_length, is_success, any_success, current_stage, info, env_idx):
@@ -294,6 +335,10 @@ class TrainingCallback(BaseCallback):
             float(info.get("inplane_alignment", np.nan)),
             float(info.get("pose_alignment", np.nan)),
             bool(info.get("glass_fits_window", False)),
+            float(info.get("fit_margin", np.nan)),
+            float(info.get("insert_depth", np.nan)),
+            float(info.get("inplane_offset", np.nan)),
+            str(info.get("reward_stage", "")),
             self.recent_collision_rate,
             self.recent_plane_violation_rate,
             self.recent_position_error,
@@ -301,6 +346,10 @@ class TrainingCallback(BaseCallback):
             self.recent_inplane_alignment,
             self.recent_pose_alignment,
             self.recent_glass_fits_rate,
+            self.recent_fit_margin,
+            self.recent_insert_depth,
+            self.recent_inplane_offset,
+            self.recent_insert_stage_rate,
             terminal_failure_reason,
             self.best_reward,
             current_stage,

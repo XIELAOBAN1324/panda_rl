@@ -1,0 +1,209 @@
+"""Nine-stage state and timing helpers for window assembly."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from enum import Enum
+import time
+from typing import Any
+
+import numpy as np
+
+
+class WindowAssemblyStage(str, Enum):
+    APPROACH = "approach"
+    DESCEND = "descend"
+    SUCTION_GRASP = "suction_grasp"
+    LIFT = "lift"
+    REORIENT = "reorient"
+    COARSE_ALIGN = "coarse_align"
+    FINE_ALIGN = "fine_align"
+    INSERT = "insert"
+    HOLD = "hold"
+
+
+WINDOW_ASSEMBLY_STAGE_ORDER = tuple(WindowAssemblyStage)
+
+
+@dataclass
+class StageRecord:
+    """One stage result, using wall-clock seconds and simulation step counts."""
+
+    stage: str
+    start_time: float
+    end_time: float
+    steps: int
+    success: bool
+    failure_reason: str | None = None
+
+
+class WindowAssemblyStageTracker:
+    """Track and validate the strict nine-stage execution order."""
+
+    def __init__(self) -> None:
+        self.records: list[StageRecord] = []
+        self._active_stage: WindowAssemblyStage | None = None
+        self._active_start_time = 0.0
+        self._active_start_step = 0
+
+    def begin(self, stage: WindowAssemblyStage, simulation_step: int) -> None:
+        expected_index = len(self.records)
+        if expected_index >= len(WINDOW_ASSEMBLY_STAGE_ORDER):
+            raise RuntimeError("All window assembly stages have already completed")
+        expected = WINDOW_ASSEMBLY_STAGE_ORDER[expected_index]
+        if stage is not expected:
+            raise RuntimeError(f"Expected stage {expected.value}, got {stage.value}")
+        if self._active_stage is not None:
+            raise RuntimeError(f"Stage {self._active_stage.value} is already active")
+        self._active_stage = stage
+        self._active_start_time = time.perf_counter()
+        self._active_start_step = int(simulation_step)
+
+    def end(
+        self,
+        simulation_step: int,
+        *,
+        success: bool,
+        failure_reason: str | None = None,
+    ) -> StageRecord:
+        if self._active_stage is None:
+            raise RuntimeError("No active window assembly stage")
+        record = StageRecord(
+            stage=self._active_stage.value,
+            start_time=self._active_start_time,
+            end_time=time.perf_counter(),
+            steps=max(int(simulation_step) - self._active_start_step, 0),
+            success=bool(success),
+            failure_reason=failure_reason,
+        )
+        self.records.append(record)
+        self._active_stage = None
+        return record
+
+    def as_dicts(self) -> list[dict[str, Any]]:
+        return [asdict(record) for record in self.records]
+
+
+class WindowAssemblyPipeline:
+    """Run the complete task while invoking a policy only in ``fine_align``."""
+
+    ERROR_KEYS = (
+        "error_u",
+        "error_v",
+        "tilt_error_t1",
+        "tilt_error_t2",
+        "yaw_error",
+    )
+
+    def __init__(self, env: Any) -> None:
+        self.env = env
+        self.base = env.unwrapped
+
+    def run_episode(
+        self,
+        policy: Any,
+        *,
+        seed: int,
+        deterministic: bool = True,
+        frame_callback: Any | None = None,
+    ) -> dict[str, Any]:
+        observation, reset_info = self.env.reset(seed=seed)
+        if frame_callback is not None:
+            frame_callback(self.env)
+        initial_errors = {
+            key: float(reset_info[key]) for key in self.ERROR_KEYS
+        }
+        actions: list[np.ndarray] = []
+        rewards: list[float] = []
+        previous_action: np.ndarray | None = None
+        smoothness: list[float] = []
+        terminated = False
+        truncated = False
+        info = reset_info
+
+        while not (terminated or truncated):
+            prediction = policy.predict(observation, deterministic=deterministic)
+            action = np.asarray(prediction[0], dtype=np.float32).reshape(5)
+            observation, reward, terminated, truncated, info = self.env.step(action)
+            actions.append(action.copy())
+            rewards.append(float(reward))
+            if previous_action is not None:
+                smoothness.append(float(np.linalg.norm(action - previous_action)))
+            previous_action = action
+            if frame_callback is not None:
+                frame_callback(self.env)
+
+        fine_success = bool(info.get("fine_align_success", False))
+        ready_for_insert = bool(info.get("ready_for_insert", False))
+        fine_end_error_values = self.base.get_fine_alignment_errors()
+        fine_end_errors = {
+            key: float(fine_end_error_values[key]) for key in self.ERROR_KEYS
+        }
+        insert_success = False
+        hold_success = False
+        failure_reason = str(info.get("failure_reason", ""))
+        if fine_success and ready_for_insert:
+            insert_success = bool(self.base.run_scripted_insert())
+            if frame_callback is not None:
+                frame_callback(self.env)
+            if insert_success:
+                hold_success = bool(self.base.run_scripted_hold())
+                if frame_callback is not None:
+                    frame_callback(self.env)
+            if not insert_success:
+                failure_reason = self._last_failure_reason("insert_failed")
+            elif not hold_success:
+                failure_reason = self._last_failure_reason("hold_failed")
+
+        pipeline_end_error_values = self.base.get_fine_alignment_errors()
+        pipeline_end_errors = {
+            key: float(pipeline_end_error_values[key]) for key in self.ERROR_KEYS
+        }
+        stage_records = self.base.stage_tracker.as_dicts()
+        stages = {
+            stage.value: {
+                "success": False,
+                "start_time": None,
+                "end_time": None,
+                "steps": 0,
+                "failure_reason": "not_run",
+            }
+            for stage in WINDOW_ASSEMBLY_STAGE_ORDER
+        }
+        for record in stage_records:
+            stages[record["stage"]] = {
+                "success": bool(record["success"]),
+                "start_time": float(record["start_time"]),
+                "end_time": float(record["end_time"]),
+                "steps": int(record["steps"]),
+                "failure_reason": record["failure_reason"] or "",
+            }
+
+        action_norms = [float(np.linalg.norm(action)) for action in actions]
+        return {
+            "seed": int(seed),
+            "stages": stages,
+            "stage_records": stage_records,
+            "initial_errors": initial_errors,
+            "final_errors": fine_end_errors,
+            "pipeline_end_errors": pipeline_end_errors,
+            "fine_align_reward": float(np.sum(rewards)) if rewards else 0.0,
+            "fine_align_steps": len(actions),
+            "fine_align_max_action_magnitude": max(action_norms, default=0.0),
+            "fine_align_mean_action_magnitude": float(np.mean(action_norms)) if action_norms else 0.0,
+            "fine_align_smoothness": float(np.mean(smoothness)) if smoothness else 0.0,
+            "fine_align_success": fine_success,
+            "ready_for_insert": ready_for_insert,
+            "insert_success": insert_success,
+            "hold_success": hold_success,
+            "full_pipeline_success": bool(fine_success and insert_success and hold_success),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "failure_reason": "" if hold_success else (failure_reason or "pipeline_incomplete"),
+        }
+
+    def _last_failure_reason(self, default: str) -> str:
+        records = self.base.stage_tracker.records
+        if records and records[-1].failure_reason:
+            return str(records[-1].failure_reason)
+        return default

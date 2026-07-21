@@ -480,25 +480,43 @@ class PickAndPlaceDenseRewardWrapper(gym.Wrapper):
             dtype=np.float32,
         )
         inplane_alignment = np.clip(inplane_alignment, -1.0, 1.0)
-        inplane_error = 1.0 - inplane_alignment
 
         base = self.unwrapped
-        distance_threshold = float(getattr(base, "window_position_threshold", 0.005))
         orientation_threshold = float(getattr(base, "orientation_threshold_cos", np.cos(np.deg2rad(5.0))))
         collision = self._info_array(info, "collision", 0.0, distances.shape)
         plane_violation = self._info_array(info, "plane_violation", 0.0, distances.shape)
         glass_fits_window = self._info_array(info, "glass_fits_window", 0.0, distances.shape)
+        fit_margin = self._info_array(
+            info,
+            "fit_margin",
+            np.where(glass_fits_window > 0.0, 0.02, -0.02),
+            distances.shape,
+        )
+        insert_depth = self._info_array(info, "insert_depth", 0.0, distances.shape)
+        inplane_offset = self._info_array(info, "inplane_offset", distances, distances.shape)
+        prealign_distance = self._info_array(info, "prealign_distance", distances, distances.shape)
+        preinsert_distance = self._info_array(info, "preinsert_distance", distances, distances.shape)
+        final_insert_distance = self._info_array(info, "final_insert_distance", distances, distances.shape)
+        reward_stage = self._info_array(
+            info,
+            "reward_stage_id",
+            ((orientation_alignment >= orientation_threshold) & (inplane_alignment >= orientation_threshold)).astype(np.float32),
+            distances.shape,
+        )
 
         return compute_insert_dense_reward(
-            distances=distances,
-            orientation_error=orientation_error,
-            inplane_error=inplane_error,
             orientation_alignment=orientation_alignment,
             inplane_alignment=inplane_alignment,
             glass_fits_window=glass_fits_window,
+            fit_margin=fit_margin,
+            insert_depth=insert_depth,
+            inplane_offset=inplane_offset,
+            prealign_distance=prealign_distance,
+            preinsert_distance=preinsert_distance,
+            final_insert_distance=final_insert_distance,
+            reward_stage=reward_stage,
             collision=collision,
             plane_violation=plane_violation,
-            distance_threshold=distance_threshold,
             orientation_threshold=orientation_threshold,
         )
 

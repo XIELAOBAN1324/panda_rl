@@ -23,6 +23,7 @@ from train.common.wrappers import (
     RewardScalingWrapper,
     SuccessTrackingWrapper,
 )
+from train.train_sac import validate_expert_runtime_config
 
 
 def is_pick_and_place_sparse(env_name: str) -> bool:
@@ -43,8 +44,15 @@ def create_env(
     expert_hint_style: str = "staged",
     residual_guidance: bool = False,
     residual_action_scale: float = 0.1,
+    expert_warmstart_only: bool = False,
 ):
     """创建环境（应用包装器）"""
+    validate_expert_runtime_config(
+        env_name=env_name,
+        expert_warmstart_only=expert_warmstart_only,
+        task_progress_features=task_progress_features,
+        residual_guidance=residual_guidance,
+    )
     env = gym.make(
         env_name,
         render_mode=render_mode,
@@ -101,6 +109,7 @@ def create_vec_env(
     expert_hint_style: str = "staged",
     residual_guidance: bool = False,
     residual_action_scale: float = 0.1,
+    expert_warmstart_only: bool = False,
 ):
     """创建向量化环境"""
 
@@ -121,6 +130,7 @@ def create_vec_env(
                 expert_hint_style=expert_hint_style,
                 residual_guidance=residual_guidance,
                 residual_action_scale=residual_action_scale,
+                expert_warmstart_only=expert_warmstart_only,
             )
         return _init
 

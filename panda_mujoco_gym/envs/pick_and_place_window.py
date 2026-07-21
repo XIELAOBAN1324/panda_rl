@@ -4,6 +4,7 @@ import numpy as np
 
 from panda_mujoco_gym.envs.insert_reward import compute_insert_dense_reward
 from panda_mujoco_gym.envs.panda_env import FrankaEnv
+from train.common.pickplace_utils import window_insert_waypoints
 
 
 MODEL_XML_PATH = os.path.join(os.path.dirname(__file__), "../assets/", "pick_and_place_window.xml")
@@ -245,6 +246,7 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
         collision_with_window = bool(self._last_collision_with_window)
         collision = bool(self._last_collision)
         glass_fits_window = bool(self._glass_fits_window())
+        insert_metrics = self._insert_reward_metrics(object_position)
         info = {
             "is_success": self._is_success(obs["achieved_goal"], self.goal),
             "ee_object_distance": float(np.linalg.norm(self.get_ee_position() - object_position)),
@@ -254,6 +256,14 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
             "pose_alignment": pose_alignment,
             "is_attached": bool(self.is_attached),
             "glass_fits_window": glass_fits_window,
+            "fit_margin": float(insert_metrics["fit_margin"]),
+            "insert_depth": float(insert_metrics["insert_depth"]),
+            "inplane_offset": float(insert_metrics["inplane_offset"]),
+            "reward_stage": str(insert_metrics["reward_stage"]),
+            "reward_stage_id": int(insert_metrics["reward_stage_id"]),
+            "prealign_distance": float(insert_metrics["prealign_distance"]),
+            "preinsert_distance": float(insert_metrics["preinsert_distance"]),
+            "final_insert_distance": float(insert_metrics["final_insert_distance"]),
             "window_center": self.window_center.copy(),
             "window_safe_goal": self.window_safe_goal.copy(),
             "window_normal": self.goal[3:6].copy(),
@@ -277,7 +287,6 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
         orientation_alignment = np.asarray(self._goal_alignment(achieved_goal, desired_goal), dtype=np.float32)
         orientation_error = 1.0 - np.clip(orientation_alignment, -1.0, 1.0)
         inplane_alignment = np.asarray(info.get("inplane_alignment", orientation_alignment), dtype=np.float32)
-        inplane_error = 1.0 - np.clip(inplane_alignment, -1.0, 1.0)
         plane_violation = np.asarray(info.get("plane_violation", False), dtype=np.float32)
         collision = np.asarray(info.get("collision", False), dtype=np.float32)
         plate_fits = np.asarray(info.get("glass_fits_window", False), dtype=np.float32)
@@ -294,15 +303,18 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
 
         if self.is_insertion_task:
             return compute_insert_dense_reward(
-                distances=position_distance,
-                orientation_error=orientation_error,
-                inplane_error=inplane_error,
                 orientation_alignment=orientation_alignment,
                 inplane_alignment=inplane_alignment,
                 glass_fits_window=plate_fits,
+                fit_margin=np.asarray(info.get("fit_margin", -1.0), dtype=np.float32),
+                insert_depth=np.asarray(info.get("insert_depth", 0.0), dtype=np.float32),
+                inplane_offset=np.asarray(info.get("inplane_offset", 1.0), dtype=np.float32),
+                prealign_distance=np.asarray(info.get("prealign_distance", position_distance), dtype=np.float32),
+                preinsert_distance=np.asarray(info.get("preinsert_distance", position_distance), dtype=np.float32),
+                final_insert_distance=np.asarray(info.get("final_insert_distance", position_distance), dtype=np.float32),
+                reward_stage=np.asarray(info.get("reward_stage_id", 0.0), dtype=np.float32),
                 collision=collision,
                 plane_violation=plane_violation,
-                distance_threshold=self.window_position_threshold,
                 orientation_threshold=self.orientation_threshold_cos,
             )
 
@@ -807,6 +819,9 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
         return position_distance, orientation_alignment
 
     def _glass_fits_window(self) -> bool:
+        return bool(self._glass_fit_margin() > 0.0)
+
+    def _glass_fit_margin(self) -> float:
         obj_pos = self.get_object_position().copy()
         obj_rot = self.get_object_rotation_matrix()
         local_corners = np.array(
@@ -826,19 +841,64 @@ class FrankaPickAndPlaceWindowEnv(FrankaEnv):
         glass_normal = self.get_glass_normal()
         normal_alignment = float(abs(np.dot(glass_normal, self.target_glass_normal)))
         if normal_alignment < self.glass_alignment_threshold_cos:
-            return False
+            return -1.0
         if bool(self._last_plane_violation):
-            return False
+            return -1.0
         if self._max_object_penetration() > self.plane_constraint_eps:
-            return False
+            return -1.0
+        margins = []
         for point in world_points:
-            if abs(float(point[0] - plane_x)) > self.glass_plane_tolerance:
-                return False
-            if abs(float(point[1] - self.window_center[1])) > half_open_y:
-                return False
-            if abs(float(point[2] - self.window_center[2])) > half_open_z:
-                return False
-        return True
+            plane_margin = self.glass_plane_tolerance - abs(float(point[0] - plane_x))
+            y_margin = half_open_y - abs(float(point[1] - self.window_center[1]))
+            z_margin = half_open_z - abs(float(point[2] - self.window_center[2]))
+            margins.extend([plane_margin, y_margin, z_margin])
+        return float(min(margins)) if margins else -1.0
+
+    def _insert_reward_metrics(self, object_position: np.ndarray) -> dict[str, float | int | str]:
+        object_position = np.asarray(object_position, dtype=np.float64)
+        goal_pos = self.goal[:3].astype(np.float64)
+        goal_normal = self.get_window_normal().astype(np.float64)
+        _, prealign, preinsert, final_insert = window_insert_waypoints(
+            object_position.astype(np.float32),
+            goal_pos.astype(np.float32),
+            goal_normal.astype(np.float32),
+        )
+        prealign = np.asarray(prealign, dtype=np.float64)
+        preinsert = np.asarray(preinsert, dtype=np.float64)
+        final_insert = np.asarray(final_insert, dtype=np.float64)
+        inplane_offset = float(np.linalg.norm((object_position - self.window_center)[1:3]))
+        fit_margin = float(self._glass_fit_margin())
+        prealign_distance = float(np.linalg.norm(object_position - prealign))
+        preinsert_distance = float(np.linalg.norm(object_position - preinsert))
+        final_insert_distance = float(np.linalg.norm(object_position - final_insert))
+        insert_axis = final_insert - preinsert
+        insert_axis_norm = float(np.linalg.norm(insert_axis))
+        if insert_axis_norm < 1e-8:
+            insert_depth = 0.0
+        else:
+            insert_depth = float(np.dot(object_position - preinsert, insert_axis) / (insert_axis_norm ** 2))
+        insert_depth = float(np.clip(insert_depth, 0.0, 1.0))
+
+        orientation_alignment = float(self._goal_alignment(self._get_obs()["achieved_goal"], self.goal))
+        inplane_alignment = float(self._glass_inplane_alignment())
+        alignment_ready = (
+            orientation_alignment >= 0.985
+            and inplane_alignment >= 0.985
+            and inplane_offset <= 0.02
+            and fit_margin >= -0.02
+        )
+        reward_stage = "insert" if alignment_ready else "align"
+        reward_stage_id = 1 if alignment_ready else 0
+        return {
+            "fit_margin": fit_margin,
+            "insert_depth": insert_depth,
+            "inplane_offset": inplane_offset,
+            "reward_stage": reward_stage,
+            "reward_stage_id": reward_stage_id,
+            "prealign_distance": prealign_distance,
+            "preinsert_distance": preinsert_distance,
+            "final_insert_distance": final_insert_distance,
+        }
 
     def _activate_grasp_weld(self) -> None:
         ee_pos = self.data.xpos[self.ee_center_body_id].copy()

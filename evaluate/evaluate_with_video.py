@@ -27,7 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import panda_mujoco_gym  # noqa: F401
 from evaluate.video_recorder import EpisodeVideoRecorder, _to_json_safe
-from train.train_sac import create_env
+from train.train_sac import create_env, validate_expert_runtime_config
 
 
 DEFAULT_ENV_ID = "FrankaPickAndPlaceWindowSparse-v0"
@@ -161,6 +161,7 @@ def _apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Di
         "task_stage_features": args.task_stage_features,
         "task_progress_features": args.task_progress_features,
         "residual_guidance": args.residual_guidance,
+        "expert_warmstart_only": args.expert_warmstart_only,
     }
     for key, value in bool_overrides.items():
         if value is not None:
@@ -175,6 +176,7 @@ def _apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Di
     effective.setdefault("expert_hint_style", "staged")
     effective.setdefault("residual_guidance", False)
     effective.setdefault("residual_action_scale", 0.1)
+    effective.setdefault("expert_warmstart_only", False)
     effective.setdefault("safe_curriculum", False)
     return effective
 
@@ -351,6 +353,7 @@ def _make_policy_env(
         expert_hint_style=str(config.get("expert_hint_style", "staged")),
         residual_guidance=bool(config.get("residual_guidance", False)),
         residual_action_scale=float(config.get("residual_action_scale", 0.1)),
+        expert_warmstart_only=bool(config.get("expert_warmstart_only", False)),
         safe_curriculum=False,
     )
 
@@ -664,6 +667,12 @@ def record_policy_videos(args: argparse.Namespace) -> Path:
         training_config["env_name"] = summary["env_name"]
 
     config = _apply_cli_overrides(training_config, args)
+    validate_expert_runtime_config(
+        env_name=str(config.get("env_name", DEFAULT_ENV_ID)),
+        expert_warmstart_only=bool(config.get("expert_warmstart_only", False)),
+        task_progress_features=bool(config.get("task_progress_features", False)),
+        residual_guidance=bool(config.get("residual_guidance", False)),
+    )
     config = _auto_match_checkpoint_config(model_path, config, args)
     vecnormalize_path = _resolve_vecnormalize_path(args, exp_dir, model_path, config)
     output_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else _default_output_dir(exp_dir, model_path)
@@ -835,6 +844,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(residual_guidance=None)
     parser.add_argument("--residual-guidance", dest="residual_guidance", action="store_true")
     parser.add_argument("--no-residual-guidance", dest="residual_guidance", action="store_false")
+    parser.add_argument(
+        "--expert-warmstart-only",
+        action="store_true",
+        help="校验当前评估配置不包含运行时 expert hint / residual guidance",
+    )
     return parser
 
 
