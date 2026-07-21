@@ -4,6 +4,10 @@ import gymnasium as gym
 import numpy as np
 
 import panda_mujoco_gym  # noqa: F401
+from panda_mujoco_gym.envs.window_assembly_geometry import (
+    project_to_rotation_matrix,
+    so3_log,
+)
 
 
 ENV_ID = "FrankaWindowFineAlignDense-v0"
@@ -32,6 +36,75 @@ def _corrective_action(base, info):
 
 def _inplane_error_norm(info):
     return float(np.hypot(info["error_u"], info["error_v"]))
+
+
+def test_reorient_flips_at_post_lift_center_before_transport(monkeypatch):
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        original_move = base._move_attached_object_pose
+        reorient_calls = []
+
+        def record_move(target_center, target_rotation, n_steps, **kwargs):
+            if base.stage.value == "reorient":
+                reorient_calls.append(
+                    {
+                        "start_center": base.get_object_position().copy(),
+                        "start_rotation": base.get_object_rotation_matrix().copy(),
+                        "target_center": np.asarray(target_center).copy(),
+                        "target_rotation": np.asarray(target_rotation).copy(),
+                        "center_feedback_gain": kwargs.get("center_feedback_gain"),
+                    }
+                )
+            return original_move(target_center, target_rotation, n_steps, **kwargs)
+
+        monkeypatch.setattr(base, "_move_attached_object_pose", record_move)
+        observation, _ = env.reset(seed=0)
+
+        assert len(reorient_calls) == 2
+        flip_call, transport_call = reorient_calls
+        target_rotation = project_to_rotation_matrix(
+            base._current_orientation_frame() @ base.GLASS_ASSEMBLY_FRAME
+        )
+        frame_center, frame_rotation = base._current_fine_frame_pose()
+        transport_position = frame_center + frame_rotation[:, 2] * max(
+            base.preinsert_normal_offset + 0.12, 0.28
+        )
+        lift_height = max(
+            base.window_center[2] + base.post_grasp_canonical_goal_margin,
+            base.initial_object_height + base.post_grasp_min_lift_above_object,
+        )
+        transport_position[2] = max(lift_height, frame_center[2] + 0.12)
+
+        assert np.allclose(flip_call["target_center"], flip_call["start_center"])
+        assert not np.allclose(flip_call["target_center"], transport_position)
+        assert np.allclose(flip_call["target_rotation"], target_rotation)
+        assert not np.allclose(flip_call["start_rotation"], target_rotation)
+        assert np.allclose(transport_call["target_center"], transport_position)
+        assert np.allclose(transport_call["target_rotation"], target_rotation)
+        flip_start_rotation_error = np.linalg.norm(
+            so3_log(target_rotation @ flip_call["start_rotation"].T)
+        )
+        transport_start_rotation_error = np.linalg.norm(
+            so3_log(target_rotation @ transport_call["start_rotation"].T)
+        )
+        assert transport_start_rotation_error < 0.15
+        assert transport_start_rotation_error < 0.1 * flip_start_rotation_error
+        assert flip_call["center_feedback_gain"] == 1.0
+        assert transport_call["center_feedback_gain"] == 1.0
+        assert [record.stage for record in base.stage_tracker.records[:6]] == [
+            "approach",
+            "descend",
+            "suction_grasp",
+            "lift",
+            "reorient",
+            "coarse_align",
+        ]
+        assert observation.shape == (11,)
+        assert env.observation_space.shape == (11,)
+        assert env.action_space.shape == (5,)
+    finally:
+        env.close()
 
 
 def test_reset_spaces_seeded_coarse_state_and_no_normal_action():

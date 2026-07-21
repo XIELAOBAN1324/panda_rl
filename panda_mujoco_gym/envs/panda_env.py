@@ -6,13 +6,19 @@ from gymnasium_robotics.envs.robot_env import MujocoRobotEnv
 from gymnasium_robotics.utils import rotations
 from typing import Optional, Any, SupportsFloat
 
-DEFAULT_CAMERA_CONFIG = {
-    "distance": 2.76,
-    "azimuth": -1.0,
-    "elevation": -25.5,
-    "lookat": np.array([0.18, -0.04, 0.185]),
-}
+# DEFAULT_CAMERA_CONFIG = {
+#     "distance": 2.76,
+#     "azimuth": -1.0,
+#     "elevation": -25.5,
+#     "lookat": np.array([0.18, -0.04, 0.185]),
+# }
 
+DEFAULT_CAMERA_CONFIG = {
+    "distance": 2.880000,
+    "azimuth": -226.000000,
+    "elevation": -18.000000,
+    "lookat": np.array([-0.000000, -0.130000, 0.230000], dtype=np.float64),
+}
 
 class FrankaEnv(MujocoRobotEnv):
     metadata = {

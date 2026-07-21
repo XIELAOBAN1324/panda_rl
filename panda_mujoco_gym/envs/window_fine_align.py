@@ -616,17 +616,24 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         transport_position[2] = max(
             float(lift_position[2]), float(frame_center[2] + 0.12)
         )
+        target_object_rotation = project_to_rotation_matrix(
+            orientation_frame @ self.GLASS_ASSEMBLY_FRAME
+        )
 
         def reorient() -> None:
+            # Reorient the glass at its actual post-lift center before transport.
+            flip_center = self.get_object_position().copy()
             self._move_attached_object_pose(
-                transport_position,
-                self.get_object_rotation_matrix(),
+                flip_center,
+                target_object_rotation,
                 3 * self.post_grasp_motion_steps,
+                center_feedback_gain=1.0,
             )
             self._move_attached_object_pose(
                 transport_position,
-                orientation_frame @ self.GLASS_ASSEMBLY_FRAME,
+                target_object_rotation,
                 3 * self.post_grasp_motion_steps,
+                center_feedback_gain=1.0,
             )
 
         self._run_scripted_stage(WindowAssemblyStage.REORIENT, reorient)
