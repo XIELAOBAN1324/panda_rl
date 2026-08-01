@@ -6,7 +6,7 @@ Capture:
     00_start.png
     01_approach_end.png
     02_descend_end.png
-    03_suction_grasp_end.png
+    03_grasp_end.png
     04_lift_end.png
     05_reorient_end.png
     06_coarse_align_end.png
@@ -14,9 +14,21 @@ Capture:
     08_insert_end.png
     09_hold_end.png
 
-The script uses a fixed 3:2 camera view and captures images directly
-with mujoco.Renderer. It does not register env.render() as the reset-time
-pipeline callback, avoiding interference with reset/goal generation.
+Additionally save the robot 13D state for the 9 stage-end images:
+    approach
+    descend
+    grasp
+    lift
+    reorient
+    coarse_align
+    fine_align
+    insert
+    hold
+
+13D state definition:
+    [q1, q2, q3, q4, q5, q6, q7,
+     ee_x, ee_y, ee_z,
+     ee_roll, ee_pitch, ee_yaw]
 
 Example:
     MUJOCO_GL=egl python capture_stage_snapshots.py \
@@ -28,11 +40,6 @@ Example:
 from __future__ import annotations
 
 import os
-
-# Select headless EGL automatically when no desktop DISPLAY is available.
-# This must be set before importing mujoco.
-if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
-    os.environ["MUJOCO_GL"] = "egl"
 
 import argparse
 import gc
@@ -54,24 +61,26 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import panda_mujoco_gym  # noqa: E402,F401
+from utils.fine_align_config import (  # noqa: E402
+    add_final_environment_arguments,
+    final_environment_kwargs,
+    validate_final_environment_kwargs,
+)
 
 
 ENV_ID = "FrankaWindowFineAlignDense-v0"
 
 DEFAULT_CAMERA_CONFIG = {
-    "distance": 2.880000,
-    "azimuth": -263.500000,
-    "elevation": -18.000000,
-    "lookat": np.array(
-        [0.000000, -0.130000, 0.230000],
-        dtype=np.float64,
-    ),
+    "distance": 2.76,
+    "azimuth": -1.0,
+    "elevation": -25.5,
+    "lookat": np.array([0.18, -0.04, 0.185], dtype=np.float64),
 }
 
 RESET_STAGE_FILES = {
     "approach": "01_approach_end.png",
     "descend": "02_descend_end.png",
-    "suction_grasp": "03_suction_grasp_end.png",
+    "grasp": "03_grasp_end.png",
     "lift": "04_lift_end.png",
     "reorient": "05_reorient_end.png",
     "coarse_align": "06_coarse_align_end.png",
@@ -81,7 +90,7 @@ EXPECTED_IMAGE_FILES = (
     "00_start.png",
     "01_approach_end.png",
     "02_descend_end.png",
-    "03_suction_grasp_end.png",
+    "03_grasp_end.png",
     "04_lift_end.png",
     "05_reorient_end.png",
     "06_coarse_align_end.png",
@@ -90,36 +99,54 @@ EXPECTED_IMAGE_FILES = (
     "09_hold_end.png",
 )
 
-# Current evaluation defaults. Values loaded from training_config.json
-# take priority when present, except for the explicit overrides below.
-DEFAULT_ENV_KWARGS: dict[str, Any] = {
-    "measurement_noise_translation_std": 0.0,
-    "measurement_noise_angle_std_deg": 0.0,
-    "preinsert_normal_offset": 0.08,
-    "fine_action_sim_steps": 4,
-    "normal_gap_correction_threshold": 0.0005,
-    "normal_gap_correction_sim_steps": 2,
-    "max_normal_gap_drift": 0.008,
-    "insert_action_sim_steps": 4,
-    "insert_translation_abort_tolerance": 0.0025,
-    "insert_tilt_abort_tolerance_deg": 0.6,
-    "insert_yaw_abort_tolerance_deg": 0.6,
-    "insert_alignment_violation_hold_steps": 2,
-    "insert_success_hold_steps": 3,
-    "insert_final_verification_max_steps": 20,
-    "insert_depth_tolerance": 0.0005,
-    "insert_step_size": 0.001,
+STAGE_ORDER_9 = (
+    "approach",
+    "descend",
+    "grasp",
+    "lift",
+    "reorient",
+    "coarse_align",
+    "fine_align",
+    "insert",
+    "hold",
+)
+
+STAGE_TO_IMAGE_9 = {
+    "approach": "01_approach_end.png",
+    "descend": "02_descend_end.png",
+    "grasp": "03_grasp_end.png",
+    "lift": "04_lift_end.png",
+    "reorient": "05_reorient_end.png",
+    "coarse_align": "06_coarse_align_end.png",
+    "fine_align": "07_fine_align_end.png",
+    "insert": "08_insert_end.png",
+    "hold": "09_hold_end.png",
 }
 
+STATE_KEYS_13D = [
+    "q1",
+    "q2",
+    "q3",
+    "q4",
+    "q5",
+    "q6",
+    "q7",
+    "ee_x",
+    "ee_y",
+    "ee_z",
+    "ee_roll",
+    "ee_pitch",
+    "ee_yaw",
+]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Capture the start state and nine stage-end images."
+        description="Capture stage snapshots and export 13D robot states."
     )
 
     parser.add_argument(
         "--model",
-        required=True,
+        default=None,
         help="Path to an SAC .zip model or checkpoint.",
     )
     parser.add_argument(
@@ -131,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="outputs/stage_snapshots",
-        help="Directory used to save PNG images and summary.json.",
+        help="Directory to save PNG images and JSON files.",
     )
     parser.add_argument(
         "--width",
@@ -167,23 +194,33 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(deterministic=True)
 
     parser.add_argument(
-        "--preinsert-normal-offset",
+        "--camera-distance",
         type=float,
-        default=0.08,
-        help="Force the pre-insertion normal offset. Default: 0.08 m.",
+        default=float(DEFAULT_CAMERA_CONFIG["distance"]),
     )
     parser.add_argument(
-        "--measurement-noise-translation-std",
+        "--camera-azimuth",
         type=float,
-        default=0.0,
-        help="Evaluation translation measurement noise.",
+        default=float(DEFAULT_CAMERA_CONFIG["azimuth"]),
     )
     parser.add_argument(
-        "--measurement-noise-angle-std-deg",
+        "--camera-elevation",
         type=float,
-        default=0.0,
-        help="Evaluation angular measurement noise in degrees.",
+        default=float(DEFAULT_CAMERA_CONFIG["elevation"]),
     )
+    parser.add_argument(
+        "--camera-lookat",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=np.asarray(DEFAULT_CAMERA_CONFIG["lookat"]).tolist(),
+    )
+    parser.add_argument(
+        "--tune-camera",
+        action="store_true",
+        help="Open the interactive camera tuner instead of capturing.",
+    )
+    add_final_environment_arguments(parser)
 
     return parser.parse_args()
 
@@ -203,78 +240,12 @@ def json_default(value: Any) -> Any:
     )
 
 
-def find_training_config(model_path: str | Path) -> Path | None:
-    model = Path(model_path).expanduser().resolve()
-
-    start_dir = model if model.is_dir() else model.parent
-
-    for directory in (start_dir, *start_dir.parents):
-        candidate = directory / "training_config.json"
-
-        if candidate.is_file():
-            return candidate
-
-    return None
-
-
-def load_environment_kwargs(
-    model_path: str | Path,
-    *,
-    preinsert_normal_offset: float,
-    measurement_noise_translation_std: float,
-    measurement_noise_angle_std_deg: float,
-) -> tuple[dict[str, Any], Path | None]:
-    """
-    Load environment parameters from the model run when available.
-
-    Priority:
-        1. Script defaults
-        2. training_config.json
-        3. Explicit snapshot-script overrides
-    """
-
-    env_kwargs = dict(DEFAULT_ENV_KWARGS)
-    config_path = find_training_config(model_path)
-
-    if config_path is not None:
-        config = json.loads(
-            config_path.read_text(encoding="utf-8")
-        )
-
-        configured_kwargs = config.get(
-            "evaluation_environment_kwargs"
-        )
-
-        if not isinstance(configured_kwargs, dict):
-            configured_kwargs = config.get(
-                "train_environment_kwargs",
-                {},
-            )
-
-        if isinstance(configured_kwargs, dict):
-            env_kwargs.update(configured_kwargs)
-
-    # Explicit overrides for this visualization script.
-    env_kwargs["preinsert_normal_offset"] = float(
-        preinsert_normal_offset
-    )
-    env_kwargs["measurement_noise_translation_std"] = float(
-        measurement_noise_translation_std
-    )
-    env_kwargs["measurement_noise_angle_std_deg"] = float(
-        measurement_noise_angle_std_deg
-    )
-
-    return env_kwargs, config_path
-
-
 def validate_image_size(width: int, height: int) -> None:
     if width <= 0 or height <= 0:
         raise ValueError(
             f"Image dimensions must be positive, got {width}x{height}"
         )
 
-    # width : height = 3 : 2
     if width * 2 != height * 3:
         raise ValueError(
             "Image dimensions must have an exact 3:2 ratio, "
@@ -282,24 +253,16 @@ def validate_image_size(width: int, height: int) -> None:
         )
 
 
-def build_free_camera() -> mujoco.MjvCamera:
+def build_free_camera(camera_config: dict[str, Any]) -> mujoco.MjvCamera:
     camera = mujoco.MjvCamera()
     camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-
-    camera.distance = float(
-        DEFAULT_CAMERA_CONFIG["distance"]
-    )
-    camera.azimuth = float(
-        DEFAULT_CAMERA_CONFIG["azimuth"]
-    )
-    camera.elevation = float(
-        DEFAULT_CAMERA_CONFIG["elevation"]
-    )
+    camera.distance = float(camera_config["distance"])
+    camera.azimuth = float(camera_config["azimuth"])
+    camera.elevation = float(camera_config["elevation"])
     camera.lookat[:] = np.asarray(
-        DEFAULT_CAMERA_CONFIG["lookat"],
+        camera_config["lookat"],
         dtype=np.float64,
     )
-
     return camera
 
 
@@ -308,11 +271,8 @@ def make_renderer(
     *,
     width: int,
     height: int,
+    camera_config: dict[str, Any],
 ) -> tuple[mujoco.Renderer, mujoco.MjvCamera]:
-    """
-    Increase the model offscreen framebuffer before Renderer creation.
-    """
-
     validate_image_size(width, height)
 
     model = base_env.model
@@ -320,14 +280,8 @@ def make_renderer(
     old_width = int(model.vis.global_.offwidth)
     old_height = int(model.vis.global_.offheight)
 
-    model.vis.global_.offwidth = max(
-        old_width,
-        int(width),
-    )
-    model.vis.global_.offheight = max(
-        old_height,
-        int(height),
-    )
+    model.vis.global_.offwidth = max(old_width, int(width))
+    model.vis.global_.offheight = max(old_height, int(height))
 
     print(
         "[capture_stage_snapshots] offscreen framebuffer: "
@@ -342,23 +296,17 @@ def make_renderer(
         width=int(width),
     )
 
-    camera = build_free_camera()
-
+    camera = build_free_camera(camera_config)
     return renderer, camera
 
 
 def close_renderer_safely(
     renderer: mujoco.Renderer | None,
 ) -> None:
-    """
-    Some older MuJoCo Renderer versions do not expose close().
-    """
-
     if renderer is None:
         return
 
     close_method = getattr(renderer, "close", None)
-
     if callable(close_method):
         close_method()
 
@@ -371,7 +319,6 @@ def render_rgb(
     renderer: mujoco.Renderer,
     camera: mujoco.MjvCamera,
 ) -> np.ndarray:
-    # Ensure all derived body and geometry transforms are up to date.
     mujoco.mj_forward(base_env.model, base_env.data)
 
     renderer.update_scene(
@@ -384,13 +331,6 @@ def render_rgb(
         dtype=np.uint8,
     )
 
-    expected_shape = (
-        int(renderer.height),
-        int(renderer.width),
-        3,
-    )
-
-    # Older versions may not expose width/height as public attributes.
     if frame.ndim != 3 or frame.shape[2] not in (3, 4):
         raise RuntimeError(
             f"Unexpected rendered frame shape: {frame.shape}"
@@ -420,10 +360,7 @@ def save_frame(
         camera,
     )
 
-    imageio.imwrite(
-        output_path,
-        frame,
-    )
+    imageio.imwrite(output_path, frame)
 
     print(
         f"[capture_stage_snapshots] saved: {output_path}"
@@ -432,12 +369,10 @@ def save_frame(
 
 def stage_to_key(stage: Any) -> str:
     value = getattr(stage, "value", None)
-
     if isinstance(value, str):
         return value.strip().lower()
 
     name = getattr(stage, "name", None)
-
     if isinstance(name, str):
         return name.strip().lower()
 
@@ -450,24 +385,231 @@ def extract_error_summary(base_env: Any) -> dict[str, float]:
     return {
         "error_u": float(errors["error_u"]),
         "error_v": float(errors["error_v"]),
-        "tilt_error_t1": float(
-            errors["tilt_error_t1"]
-        ),
-        "tilt_error_t2": float(
-            errors["tilt_error_t2"]
-        ),
+        "tilt_error_t1": float(errors["tilt_error_t1"]),
+        "tilt_error_t2": float(errors["tilt_error_t2"]),
         "yaw_error": float(errors["yaw_error"]),
-        "current_normal_gap": float(
-            errors["current_normal_gap"]
-        ),
-        "normal_gap_error": float(
-            errors["normal_gap_error"]
-        ),
+        "current_normal_gap": float(errors["current_normal_gap"]),
+        "normal_gap_error": float(errors["normal_gap_error"]),
     }
+
+
+def rotation_matrix_to_rpy_xyz(rotation: np.ndarray) -> np.ndarray:
+    """
+    Convert a 3x3 rotation matrix to roll, pitch, yaw (radians).
+    """
+    r = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+
+    sy = np.sqrt(r[0, 0] * r[0, 0] + r[1, 0] * r[1, 0])
+    singular = sy < 1e-8
+
+    if not singular:
+        roll = np.arctan2(r[2, 1], r[2, 2])
+        pitch = np.arctan2(-r[2, 0], sy)
+        yaw = np.arctan2(r[1, 0], r[0, 0])
+    else:
+        roll = np.arctan2(-r[1, 2], r[1, 1])
+        pitch = np.arctan2(-r[2, 0], sy)
+        yaw = 0.0
+
+    return np.array([roll, pitch, yaw], dtype=np.float64)
+
+
+def find_arm_joint_names(base_env: Any) -> list[str]:
+    """
+    Resolve the 7 Franka arm joint names.
+    """
+    candidate_attrs = [
+        "arm_joint_names",
+        "panda_joint_names",
+        "robot_joint_names",
+        "joint_names",
+    ]
+
+    for attr_name in candidate_attrs:
+        names = getattr(base_env, attr_name, None)
+        if isinstance(names, (list, tuple)) and len(names) >= 7:
+            return [str(name) for name in list(names)[:7]]
+
+    model = base_env.model
+    names: list[str] = []
+
+    for joint_id in range(model.njnt):
+        joint_name = mujoco.mj_id2name(
+            model,
+            mujoco.mjtObj.mjOBJ_JOINT,
+            joint_id,
+        )
+
+        if joint_name is None:
+            continue
+
+        if joint_name.startswith("panda_joint"):
+            names.append(joint_name)
+
+    if len(names) >= 7:
+        def _joint_index(name: str) -> int:
+            digits = "".join(ch for ch in name if ch.isdigit())
+            return int(digits) if digits else 999
+
+        names = sorted(names, key=_joint_index)
+        return names[:7]
+
+    raise RuntimeError(
+        "Could not resolve the 7 Franka joint names."
+    )
+
+
+def extract_robot_state_13d(base_env: Any) -> dict[str, Any]:
+    """
+    Extract the 13D Franka robot state.
+
+    State definition:
+        [
+            q1, q2, q3, q4, q5, q6, q7,
+            ee_x, ee_y, ee_z,
+            ee_roll, ee_pitch, ee_yaw,
+        ]
+
+    Units:
+        joint positions: rad
+        end-effector position: m
+        end-effector RPY: rad
+    """
+
+    model = base_env.model
+    data = base_env.data
+
+    # Update all derived kinematic quantities before reading them.
+    mujoco.mj_forward(model, data)
+
+    # The current environment already resolves the seven Franka
+    # arm joint names during initialization.
+    joint_names = list(
+        getattr(base_env, "arm_joint_names", [])
+    )
+
+    if len(joint_names) != 7:
+        # Retain the fallback for model variants.
+        joint_names = find_arm_joint_names(base_env)
+
+    if len(joint_names) != 7:
+        raise RuntimeError(
+            "Expected exactly 7 Franka arm joints, "
+            f"but resolved {len(joint_names)}: {joint_names}"
+        )
+
+    joint_positions: list[float] = []
+
+    for joint_name in joint_names:
+        joint_id = mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_JOINT,
+            joint_name,
+        )
+
+        if joint_id < 0:
+            raise RuntimeError(
+                f"Joint does not exist in MuJoCo model: "
+                f"{joint_name}"
+            )
+
+        qpos_address = int(
+            model.jnt_qposadr[joint_id]
+        )
+
+        joint_positions.append(
+            float(data.qpos[qpos_address])
+        )
+
+    # Use the environment's official end-effector accessors.
+    # In the current model these access ee_center_site.
+    ee_position = np.asarray(
+        base_env.get_ee_position(),
+        dtype=np.float64,
+    ).reshape(3).copy()
+
+    ee_rotation = np.asarray(
+        base_env.get_ee_rotation_matrix(),
+        dtype=np.float64,
+    ).reshape(3, 3).copy()
+
+    ee_rpy = rotation_matrix_to_rpy_xyz(
+        ee_rotation
+    )
+
+    state = np.concatenate(
+        [
+            np.asarray(
+                joint_positions,
+                dtype=np.float64,
+            ),
+            ee_position,
+            ee_rpy,
+        ],
+        axis=0,
+    )
+
+    if state.shape != (13,):
+        raise RuntimeError(
+            "Robot state dimension mismatch: "
+            f"expected (13,), got {state.shape}"
+        )
+
+    if not np.all(np.isfinite(state)):
+        raise RuntimeError(
+            f"Robot 13D state contains NaN or Inf: {state}"
+        )
+
+    named_state = {
+        key: float(value)
+        for key, value in zip(
+            STATE_KEYS_13D,
+            state,
+        )
+    }
+
+    # Keep the actual site id as auxiliary metadata.
+    ee_site_id = mujoco.mj_name2id(
+        model,
+        mujoco.mjtObj.mjOBJ_SITE,
+        "ee_center_site",
+    )
+
+    return {
+        "state": [
+            float(value)
+            for value in state
+        ],
+        "named_state": named_state,
+        "joint_names": joint_names,
+        "joint_position_unit": "rad",
+        "ee_position_unit": "m",
+        "ee_orientation_type": "roll_pitch_yaw_xyz",
+        "ee_orientation_unit": "rad",
+        "ee_reference_site": "ee_center_site",
+        "ee_site_id": int(ee_site_id),
+    }
+
+
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.tune_camera:
+        if not os.environ.get("DISPLAY"):
+            raise RuntimeError("--tune-camera requires a desktop DISPLAY")
+        from evaluate.tune_camera_view import InteractiveCameraTuner
+
+        tuner = InteractiveCameraTuner(env_id=ENV_ID, seed=args.seed)
+        try:
+            tuner.run()
+        finally:
+            tuner.close()
+        return
+
+    if args.model is None:
+        raise ValueError("--model is required unless --tune-camera is used")
 
     validate_image_size(
         args.width,
@@ -481,29 +623,20 @@ def main() -> None:
             f"Model file does not exist: {model_path}"
         )
 
-    output_dir = Path(
-        args.output_dir
-    ).expanduser().resolve()
-
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    env_kwargs, training_config_path = (
-        load_environment_kwargs(
-            model_path,
-            preinsert_normal_offset=(
-                args.preinsert_normal_offset
-            ),
-            measurement_noise_translation_std=(
-                args.measurement_noise_translation_std
-            ),
-            measurement_noise_angle_std_deg=(
-                args.measurement_noise_angle_std_deg
-            ),
-        )
-    )
+    env_kwargs = final_environment_kwargs(args)
+    validate_final_environment_kwargs(env_kwargs)
+    camera_config = {
+        "distance": float(args.camera_distance),
+        "azimuth": float(args.camera_azimuth),
+        "elevation": float(args.camera_elevation),
+        "lookat": np.asarray(args.camera_lookat, dtype=np.float64),
+    }
 
     print(
         "[capture_stage_snapshots] MUJOCO_GL =",
@@ -516,10 +649,6 @@ def main() -> None:
     print(
         "[capture_stage_snapshots] seed =",
         args.seed,
-    )
-    print(
-        "[capture_stage_snapshots] training config =",
-        training_config_path or "<not found>",
     )
     print(
         "[capture_stage_snapshots] preinsert_normal_offset =",
@@ -539,6 +668,9 @@ def main() -> None:
 
     saved_files: dict[str, str] = {}
     stage_end_errors: dict[str, dict[str, float]] = {}
+
+    # New: 9 stage robot states
+    stage_robot_states_13d: dict[str, dict[str, Any]] = {}
 
     fine_info: dict[str, Any] = {}
     fine_steps = 0
@@ -573,11 +705,77 @@ def main() -> None:
 
         saved_files[filename] = str(path)
 
+    def save_stage_robot_state(
+        stage_name: str,
+    ) -> None:
+        if stage_name not in STAGE_ORDER_9:
+            return
+
+        state_info = extract_robot_state_13d(
+            base
+        )
+
+        stage_robot_states_13d[stage_name] = {
+            "stage": stage_name,
+            "image_file": STAGE_TO_IMAGE_9[
+                stage_name
+            ],
+            "state_dim": 13,
+            "state_definition": (
+                "7 joint positions + "
+                "end-effector xyz + "
+                "end-effector roll/pitch/yaw"
+            ),
+            "state_keys": list(
+                STATE_KEYS_13D
+            ),
+            "state": state_info["state"],
+            "named_state": (
+                state_info["named_state"]
+            ),
+            "joint_names": (
+                state_info["joint_names"]
+            ),
+            "joint_position_unit": (
+                state_info["joint_position_unit"]
+            ),
+            "ee_position_unit": (
+                state_info["ee_position_unit"]
+            ),
+            "ee_orientation_type": (
+                state_info[
+                    "ee_orientation_type"
+                ]
+            ),
+            "ee_orientation_unit": (
+                state_info[
+                    "ee_orientation_unit"
+                ]
+            ),
+            "ee_reference_site": (
+                state_info[
+                    "ee_reference_site"
+                ]
+            ),
+            "ee_site_id": (
+                state_info["ee_site_id"]
+            ),
+            "simulation_time": float(
+                base.data.time
+            ),
+        }
+
+        print(
+            "[capture_stage_snapshots] "
+            f"captured 13D state: {stage_name}"
+        )
+
     try:
         renderer, camera = make_renderer(
             base,
             width=args.width,
             height=args.height,
+            camera_config=camera_config,
         )
 
         model = SAC.load(
@@ -585,17 +783,7 @@ def main() -> None:
             device=args.device,
         )
 
-        # -----------------------------------------------------
-        # Capture reset-time stages.
-        #
-        # Do not assign env.render as pipeline_frame_callback
-        # before reset. Captures are made directly with the
-        # standalone Renderer, avoiding reset/render callbacks.
-        # -----------------------------------------------------
-
-        original_run_scripted_stage = (
-            base._run_scripted_stage
-        )
+        original_run_scripted_stage = base._run_scripted_stage
 
         def wrapped_run_scripted_stage(
             stage: Any,
@@ -603,8 +791,6 @@ def main() -> None:
         ) -> Any:
             stage_key = stage_to_key(stage)
 
-            # Start state: window and object have been sampled,
-            # but APPROACH has not yet executed.
             if (
                 stage_key == "approach"
                 and "00_start.png" not in saved_files
@@ -616,9 +802,7 @@ def main() -> None:
                 operation,
             )
 
-            filename = RESET_STAGE_FILES.get(
-                stage_key
-            )
+            filename = RESET_STAGE_FILES.get(stage_key)
 
             if filename is not None:
                 save_named_image(filename)
@@ -628,27 +812,19 @@ def main() -> None:
                         extract_error_summary(base)
                     )
                 except Exception:
-                    # Early stages do not necessarily have
-                    # meaningful final fine-alignment diagnostics.
                     pass
+
+                # New: save 13D state for reset-time stage end
+                save_stage_robot_state(stage_key)
 
             return result
 
-        base._run_scripted_stage = (
-            wrapped_run_scripted_stage
-        )
+        base._run_scripted_stage = wrapped_run_scripted_stage
 
         try:
-            obs, reset_info = env.reset(
-                seed=args.seed
-            )
+            obs, reset_info = env.reset(seed=args.seed)
         finally:
-            # Restore the environment method immediately after
-            # reset so the temporary capture hook does not affect
-            # later pipeline logic.
-            base._run_scripted_stage = (
-                original_run_scripted_stage
-            )
+            base._run_scripted_stage = original_run_scripted_stage
 
         missing_reset_images = [
             filename
@@ -662,10 +838,7 @@ def main() -> None:
                 f"images: {missing_reset_images}"
             )
 
-        # -----------------------------------------------------
         # Stage 7: fine alignment
-        # -----------------------------------------------------
-
         terminated = False
         truncated = False
         fine_info = dict(reset_info)
@@ -687,16 +860,11 @@ def main() -> None:
             fine_steps += 1
 
         save_named_image("07_fine_align_end.png")
-
-        stage_end_errors["fine_align"] = (
-            extract_error_summary(base)
-        )
+        stage_end_errors["fine_align"] = extract_error_summary(base)
+        save_stage_robot_state("fine_align")
 
         fine_success = bool(
-            fine_info.get(
-                "fine_align_success",
-                False,
-            )
+            fine_info.get("fine_align_success", False)
         )
 
         if not fine_success:
@@ -708,10 +876,7 @@ def main() -> None:
                 )
             )
 
-        # -----------------------------------------------------
         # Stage 8: scripted insert
-        # -----------------------------------------------------
-
         if fine_success:
             insert_success = bool(
                 base.run_scripted_insert()
@@ -722,10 +887,8 @@ def main() -> None:
             )
 
             save_named_image("08_insert_end.png")
-
-            stage_end_errors["insert"] = (
-                extract_error_summary(base)
-            )
+            stage_end_errors["insert"] = extract_error_summary(base)
+            save_stage_robot_state("insert")
 
             if not insert_success:
                 failure_stage = "insert"
@@ -736,10 +899,7 @@ def main() -> None:
                     )
                 )
 
-        # -----------------------------------------------------
         # Stage 9: scripted hold
-        # -----------------------------------------------------
-
         if insert_success:
             hold_success = bool(
                 base.run_scripted_hold()
@@ -750,10 +910,8 @@ def main() -> None:
             )
 
             save_named_image("09_hold_end.png")
-
-            stage_end_errors["hold"] = (
-                extract_error_summary(base)
-            )
+            stage_end_errors["hold"] = extract_error_summary(base)
+            save_stage_robot_state("hold")
 
             if not hold_success:
                 failure_stage = "hold"
@@ -764,27 +922,18 @@ def main() -> None:
                     )
                 )
 
-        # -----------------------------------------------------
         # Final strict assembly verification
-        # -----------------------------------------------------
-
         if hold_success:
             (
                 assembly_verified,
                 assembly_diagnostics,
             ) = base.verify_final_assembly()
 
-            assembly_verified = bool(
-                assembly_verified
-            )
-            assembly_diagnostics = dict(
-                assembly_diagnostics
-            )
+            assembly_verified = bool(assembly_verified)
+            assembly_diagnostics = dict(assembly_diagnostics)
 
             if not assembly_verified:
-                failure_stage = (
-                    "final_assembly_verification"
-                )
+                failure_stage = "final_assembly_verification"
                 failure_reason = str(
                     assembly_diagnostics.get(
                         "failure_reason",
@@ -799,72 +948,61 @@ def main() -> None:
             and assembly_verified
         )
 
+        # New: save dedicated 13D stage-state json
+        stage_state_payload = {
+            "model": str(model_path),
+            "seed": int(args.seed),
+            "state_definition": "13D = 7 joint positions + ee_xyz + ee_rpy_xyz(rad)",
+            "state_keys": STATE_KEYS_13D,
+            "stage_order": list(STAGE_ORDER_9),
+            "states": stage_robot_states_13d,
+        }
+
+        stage_state_json_path = output_dir / "stage_robot_states_13d.json"
+        stage_state_json_path.write_text(
+            json.dumps(
+                stage_state_payload,
+                indent=2,
+                ensure_ascii=False,
+                default=json_default,
+            ),
+            encoding="utf-8",
+        )
+
         summary = {
             "model": str(model_path),
             "seed": int(args.seed),
-            "deterministic": bool(
-                args.deterministic
-            ),
+            "deterministic": bool(args.deterministic),
             "image_width": int(args.width),
             "image_height": int(args.height),
             "aspect_ratio": "3:2",
             "camera_config": {
-                "distance": float(
-                    DEFAULT_CAMERA_CONFIG["distance"]
-                ),
-                "azimuth": float(
-                    DEFAULT_CAMERA_CONFIG["azimuth"]
-                ),
-                "elevation": float(
-                    DEFAULT_CAMERA_CONFIG["elevation"]
-                ),
+                "distance": float(camera_config["distance"]),
+                "azimuth": float(camera_config["azimuth"]),
+                "elevation": float(camera_config["elevation"]),
                 "lookat": np.asarray(
-                    DEFAULT_CAMERA_CONFIG["lookat"]
+                    camera_config["lookat"]
                 ).tolist(),
             },
-            "mujoco_gl": os.environ.get(
-                "MUJOCO_GL",
-                "",
-            ),
-            "training_config_path": (
-                str(training_config_path)
-                if training_config_path is not None
-                else ""
-            ),
+            "mujoco_gl": os.environ.get("MUJOCO_GL", ""),
             "environment_kwargs": env_kwargs,
             "saved_files": saved_files,
             "stage_end_errors": stage_end_errors,
+            "stage_robot_states_json": str(stage_state_json_path),
             "fine_align_steps": int(fine_steps),
-            "fine_align_success": bool(
-                fine_success
-            ),
-            "insert_success": bool(
-                insert_success
-            ),
-            "hold_success": bool(
-                hold_success
-            ),
-            "assembly_verified": bool(
-                assembly_verified
-            ),
-            "full_pipeline_success": bool(
-                full_pipeline_success
-            ),
+            "fine_align_success": bool(fine_success),
+            "insert_success": bool(insert_success),
+            "hold_success": bool(hold_success),
+            "assembly_verified": bool(assembly_verified),
+            "full_pipeline_success": bool(full_pipeline_success),
             "failure_stage": failure_stage,
             "failure_reason": failure_reason,
             "fine_info": fine_info,
-            "insert_diagnostics": (
-                insert_diagnostics
-            ),
-            "assembly_diagnostics": (
-                assembly_diagnostics
-            ),
+            "insert_diagnostics": insert_diagnostics,
+            "assembly_diagnostics": assembly_diagnostics,
         }
 
-        summary_path = (
-            output_dir / "summary.json"
-        )
-
+        summary_path = output_dir / "summary.json"
         summary_path.write_text(
             json.dumps(
                 summary,
@@ -886,43 +1024,41 @@ def main() -> None:
             f"assembly_verified={assembly_verified} "
             f"full={full_pipeline_success}"
         )
-        print(
-            f"fine_steps={fine_steps}"
-        )
+        print(f"fine_steps={fine_steps}")
 
         if failure_reason:
-            print(
-                f"failure_stage={failure_stage}"
-            )
-            print(
-                f"failure_reason={failure_reason}"
-            )
+            print(f"failure_stage={failure_stage}")
+            print(f"failure_reason={failure_reason}")
         else:
             print("failure=none")
 
         print()
         print("Saved images:")
-
         for filename in EXPECTED_IMAGE_FILES:
             path = saved_files.get(filename)
-
             if path is None:
-                print(
-                    f"  [missing] {filename}"
-                )
+                print(f"  [missing] {filename}")
             else:
-                print(
-                    f"  [saved]   {filename}"
-                )
+                print(f"  [saved]   {filename}")
 
         print()
-        print(
-            f"Summary: {summary_path}"
-        )
+        print(f"Stage-state JSON: {stage_state_json_path}")
+        print(f"Summary: {summary_path}")
         print("=" * 72)
 
-        # Do not silently create fake images for stages that did
-        # not actually run.
+        missing_stage_states = [
+            stage_name
+            for stage_name in STAGE_ORDER_9
+            if stage_name not in stage_robot_states_13d
+        ]
+
+        if missing_stage_states:
+            raise RuntimeError(
+                "Missing 13D robot states for one or more stages: "
+                f"{missing_stage_states}. "
+                f"See {stage_state_json_path}"
+            )
+
         if not full_pipeline_success:
             missing = [
                 filename

@@ -12,7 +12,9 @@ from typing import Any, Mapping
 import numpy as np
 from gymnasium import spaces
 
-from panda_mujoco_gym.envs.pick_and_place_window import FrankaPickAndPlaceWindowEnv
+from panda_mujoco_gym.envs.window_assembly_controller import (
+    WindowAssemblyController,
+)
 from panda_mujoco_gym.envs.window_assembly_geometry import (
     alignment_errors_from_corners,
     fine_alignment_costs,
@@ -26,9 +28,10 @@ from panda_mujoco_gym.envs.window_assembly_pipeline import (
     WindowAssemblyStage,
     WindowAssemblyStageTracker,
 )
+from panda_mujoco_gym.envs.window_assembly_scene import WindowAssemblyScene
 
 
-class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
+class FrankaWindowFineAlignEnv(WindowAssemblyScene):
     """Five-DoF dense-reward environment for the fine-alignment stage only."""
 
     # The suction cup grasps the XML glass from its local +normal side.  The
@@ -49,7 +52,6 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.coarse_translation_range = float(kwargs.pop("coarse_translation_range", 0.015))
         self.coarse_tilt_range_rad = np.deg2rad(float(kwargs.pop("coarse_tilt_range_deg", 2.0)))
         self.coarse_yaw_range_rad = np.deg2rad(float(kwargs.pop("coarse_yaw_range_deg", 4.0)))
-        kwargs.pop("coarse_normal_gap", None)
         self.preinsert_normal_offset = float(
             kwargs.pop("preinsert_normal_offset", 0.08)
         )
@@ -204,21 +206,15 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         self.stage_tracker = WindowAssemblyStageTracker()
         self.coarse_alignment_sample = np.zeros(5, dtype=np.float64)
         self.pipeline_frame_callback: Any | None = None
+        self.script_controller = WindowAssemblyController(self)
         self._fine_frame_center_world: np.ndarray | None = None
         self._fine_frame_rotation_world: np.ndarray | None = None
         self._fine_orientation_frame_world: np.ndarray | None = None
         self._last_step_gap_diagnostics = self._empty_gap_command_diagnostics()
         self._last_insert_diagnostics = self._empty_insert_diagnostics()
 
-        kwargs.pop("reset_mode", None)
-        kwargs.pop("scripted_pickup", None)
-        kwargs.pop("constrain_robot_to_window_plane", None)
         super().__init__(
             reward_type=reward_type,
-            reset_mode="full_task",
-            scripted_pickup=True,
-            constrain_robot_to_window_plane=False,
-            terminate_on_success=False,
             **kwargs,
         )
 
@@ -584,7 +580,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             lambda: self._move_mocap_pose(descend_position, self.grasp_site_pose, self.post_grasp_motion_steps),
         )
 
-        def suction_grasp() -> None:
+        def grasp() -> None:
             self._activate_grasp_weld()
             self._mujoco_step()
             self._simulation_step_count += 1
@@ -593,7 +589,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
             if not self._grasp_weld_is_active():
                 raise RuntimeError("Scripted suction weld did not activate")
 
-        self._run_scripted_stage(WindowAssemblyStage.SUCTION_GRASP, suction_grasp)
+        self._run_scripted_stage(WindowAssemblyStage.GRASP, grasp)
 
         lift_height = float(
             max(
@@ -692,16 +688,7 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         return observation, info
 
     def _run_scripted_stage(self, stage: WindowAssemblyStage, operation: Any) -> None:
-        self.stage = stage
-        self.stage_tracker.begin(stage, self._simulation_step_count)
-        try:
-            operation()
-        except Exception as exc:
-            self.stage_tracker.end(
-                self._simulation_step_count, success=False, failure_reason=str(exc)
-            )
-            raise
-        self.stage_tracker.end(self._simulation_step_count, success=True)
+        self.script_controller.run_stage(stage, operation)
 
     def _sample_and_apply_coarse_alignment(self, frame_rotation: np.ndarray) -> None:
         canonical_state = self._capture_sim_state()
@@ -1628,21 +1615,8 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
     def _move_mocap_pose(
         self, target_position: np.ndarray, target_quaternion: np.ndarray, n_steps: int
     ) -> None:
-        start_position = self.get_ee_position().copy()
-        start_quaternion = self.get_mocap_quaternion().copy()
-        target_position = np.asarray(target_position, dtype=np.float64)
-        target_quaternion = np.asarray(target_quaternion, dtype=np.float64)
-        for step_index in range(max(int(n_steps), 1)):
-            alpha = float(step_index + 1) / float(max(int(n_steps), 1))
-            position = (1.0 - alpha) * start_position + alpha * target_position
-            quaternion = self._slerp(start_quaternion, target_quaternion, alpha)
-            self.set_mocap_pose(position, quaternion)
-            self._mujoco_step()
-            self._simulation_step_count += 1
-            self._mujoco.mj_forward(self.model, self.data)
-            self._emit_pipeline_frame()
-        self._last_ee_target_error = float(
-            np.linalg.norm(self.get_ee_position() - target_position)
+        self.script_controller.move_mocap_pose(
+            target_position, target_quaternion, n_steps
         )
 
     def _move_attached_object_pose(
@@ -1653,40 +1627,11 @@ class FrankaWindowFineAlignEnv(FrankaPickAndPlaceWindowEnv):
         *,
         center_feedback_gain: float = 0.0,
     ) -> None:
-        if not self._grasp_weld_is_active():
-            raise RuntimeError("Cannot move an object that is not suction-attached")
-        target_center = np.asarray(target_object_center, dtype=np.float64)
-        target_object_rotation = project_to_rotation_matrix(target_object_rotation)
-        start_center = self.get_object_position().copy()
-        start_object_rotation = self.get_object_rotation_matrix().copy()
-        start_ee_rotation = np.asarray(
-            self.data.xmat[self.ee_center_body_id], dtype=np.float64
-        ).reshape(3, 3).copy()
-        start_ee_quaternion = self.get_mocap_quaternion().copy()
-        world_rotation_delta = target_object_rotation @ start_object_rotation.T
-        world_rotation_vector = so3_log(world_rotation_delta)
-        last_ee_target = self.get_ee_position().copy()
-        for step_index in range(max(int(n_steps), 1)):
-            alpha = float(step_index + 1) / float(max(int(n_steps), 1))
-            desired_center = (1.0 - alpha) * start_center + alpha * target_center
-            interpolated_delta = so3_exp(alpha * world_rotation_vector)
-            delta_quaternion = self._matrix_to_quaternion(interpolated_delta)
-            ee_quaternion = self._normalize_vector(
-                self._quat_multiply(delta_quaternion, start_ee_quaternion)
-            )
-            desired_ee_rotation = interpolated_delta @ start_ee_rotation
-            ee_position = desired_center - desired_ee_rotation @ self._grasp_relative_position
-            if center_feedback_gain != 0.0:
-                center_error = desired_center - self.get_object_position().copy()
-                ee_position = ee_position + float(center_feedback_gain) * center_error
-            last_ee_target = ee_position.copy()
-            self.set_mocap_pose(ee_position, ee_quaternion)
-            self._mujoco_step()
-            self._simulation_step_count += 1
-            self._mujoco.mj_forward(self.model, self.data)
-            self._emit_pipeline_frame()
-        self._last_ee_target_error = float(
-            np.linalg.norm(self.get_ee_position() - last_ee_target)
+        self.script_controller.move_attached_object_pose(
+            target_object_center,
+            target_object_rotation,
+            n_steps,
+            center_feedback_gain=center_feedback_gain,
         )
 
     def _matrix_to_quaternion(self, rotation: np.ndarray) -> np.ndarray:

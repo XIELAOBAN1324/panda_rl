@@ -1,145 +1,48 @@
-"""
-文件读写工具函数
-"""
+"""Explicit JSON and SAC model IO helpers."""
 
-import os
+from __future__ import annotations
+
 import json
-import re
-from typing import Dict, Any, Optional
-from stable_baselines3 import SAC, PPO, TD3
-from stable_baselines3.common.vec_env import VecNormalize
+from pathlib import Path
+from typing import Any
+
+from stable_baselines3 import SAC
 
 
-ALGORITHM_CLASSES = {
-    'SAC': SAC,
-    'PPO': PPO,
-    'TD3': TD3,
-}
+def load_sac_model(
+    model_path: str | Path,
+    *,
+    env: Any = None,
+    device: str = "auto",
+) -> SAC:
+    """Load exactly the requested SAC artifact without configuration inference."""
 
-CHECKPOINT_NAME_PATTERN = re.compile(
-    r"^(?P<algorithm>[A-Za-z0-9]+)_(?P<env_name>.+)_(?P<steps>\d+)_steps\.zip$"
-)
-
-
-def load_model(model_path: str, algorithm: str = 'SAC', env=None):
-    """加载已保存的模型"""
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"找不到模型文件: {model_path}")
-
-    model_class = ALGORITHM_CLASSES.get(algorithm.upper())
-    if model_class is None:
-        raise ValueError(f"不支持的算法: {algorithm}")
-
-    return model_class.load(model_path, env=env)
+    path = Path(model_path).expanduser()
+    if not path.is_file() and path.suffix != ".zip":
+        zip_path = path.with_suffix(".zip")
+        if zip_path.is_file():
+            path = zip_path
+    if not path.is_file():
+        raise FileNotFoundError(f"SAC model does not exist: {path}")
+    return SAC.load(str(path), env=env, device=device)
 
 
-def load_vec_normalize(vec_normalize_path: str, vec_env):
-    """加载 VecNormalize 统计信息"""
-    if not os.path.exists(vec_normalize_path):
-        raise FileNotFoundError(f"找不到 VecNormalize 文件: {vec_normalize_path}")
+def save_json(data: Any, path: str | Path) -> Path:
+    """Write UTF-8 JSON, creating only the requested parent directory."""
 
-    return VecNormalize.load(vec_normalize_path, vec_env)
-
-
-def save_json(data: Dict[str, Any], filepath: str):
-    """保存 JSON 文件"""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=4)
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(data, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return output_path
 
 
-def load_json(filepath: str) -> Dict[str, Any]:
-    """加载 JSON 文件"""
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"找不到 JSON 文件: {filepath}")
+def load_json(path: str | Path) -> Any:
+    """Load UTF-8 JSON from an explicit path."""
 
-    with open(filepath, 'r') as f:
-        return json.load(f)
-
-
-def _infer_run_identity_from_checkpoint_name(filename: str) -> Dict[str, str]:
-    """从 checkpoint 文件名里恢复算法名与环境名。"""
-    match = CHECKPOINT_NAME_PATTERN.match(filename)
-    if not match:
-        return {}
-
-    return {
-        'algorithm': match.group('algorithm').upper(),
-        'env_name': match.group('env_name'),
-    }
-
-
-def get_experiment_info(exp_dir: str) -> Dict[str, Any]:
-    """从实验目录中提取信息"""
-    info: Dict[str, Any] = {}
-
-    summary_candidates = [
-        os.path.join(exp_dir, 'training_summary.json'),
-        os.path.join(exp_dir, 'logs', 'training_summary.json'),
-    ]
-    for summary_path in summary_candidates:
-        if os.path.exists(summary_path):
-            info.update(load_json(summary_path))
-            info['summary_path'] = summary_path
-            break
-
-    models_dir = os.path.join(exp_dir, 'models')
-    available_models = set()
-    if os.path.exists(models_dir):
-        for file in os.listdir(models_dir):
-            if file.endswith('.zip'):
-                available_models.add(file.replace('.zip', ''))
-
-    # 仅存在 stage stats 的阶段（例如 stage_0_random）也纳入评估范围
-    logs_dir = os.path.join(exp_dir, 'logs')
-    if os.path.exists(logs_dir):
-        for file in os.listdir(logs_dir):
-            if file.startswith('stage_') and file.endswith('_stats.npz'):
-                available_models.add(file.replace('_stats.npz', ''))
-
-    if available_models:
-        info['available_models'] = sorted(available_models)
-
-    checkpoint_candidates = [
-        os.path.join(exp_dir, 'models', 'checkpoints'),
-        os.path.join(exp_dir, 'checkpoints'),
-    ]
-    for checkpoints_dir in checkpoint_candidates:
-        if os.path.exists(checkpoints_dir):
-            checkpoints = [f for f in os.listdir(checkpoints_dir) if f.endswith('.zip')]
-            info['checkpoints'] = sorted(checkpoints)
-            info['checkpoints_dir'] = checkpoints_dir
-            for checkpoint_name in info['checkpoints']:
-                inferred = _infer_run_identity_from_checkpoint_name(checkpoint_name)
-                if not inferred:
-                    continue
-                if 'algorithm' not in info:
-                    info['algorithm'] = inferred['algorithm']
-                    info['algorithm_source'] = 'checkpoint_name'
-                if 'env_name' not in info:
-                    info['env_name'] = inferred['env_name']
-                    info['env_name_source'] = 'checkpoint_name'
-                break
-            break
-
-    return info
-
-
-def find_latest_experiment(base_dir: str = 'outputs', env_name: str = None) -> Optional[str]:
-    """查找最近的实验目录"""
-    if not os.path.exists(base_dir):
-        return None
-
-    experiments = []
-    for exp_dir in os.listdir(base_dir):
-        full_path = os.path.join(base_dir, exp_dir)
-        if os.path.isdir(full_path):
-            if env_name and env_name not in exp_dir:
-                continue
-            experiments.append((full_path, os.path.getmtime(full_path)))
-
-    if experiments:
-        experiments.sort(key=lambda x: x[1], reverse=True)
-        return experiments[0][0]
-
-    return None
+    input_path = Path(path).expanduser()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"JSON file does not exist: {input_path}")
+    return json.loads(input_path.read_text(encoding="utf-8"))

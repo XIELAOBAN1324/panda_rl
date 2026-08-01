@@ -2,3 +2,7 @@ mujoco==2.3.3
 gymnasium==0.29.1
 gymnasium-robotics==1.2.2
 stable-baselines3==2.2.1
+imageio==2.37.3
+opencv-python==4.13.0.92
+glfw==2.10.0
+pytest==9.0.3

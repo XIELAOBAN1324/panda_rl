@@ -1,13 +1,6 @@
-from .video_recorder import EpisodeVideoRecorder
+"""Evaluation and recording helpers for window assembly."""
 
-try:
-    from .evaluate_with_video import evaluate_experiment
-except ModuleNotFoundError:
-    evaluate_experiment = None
+from evaluate.video_recorder import EpisodeVideoRecorder
 
-try:
-    from .video_recorder import StageVideoRecorder
-except ImportError:
-    StageVideoRecorder = None
 
-__all__ = ["evaluate_experiment", "EpisodeVideoRecorder", "StageVideoRecorder"]
+__all__ = ["EpisodeVideoRecorder"]

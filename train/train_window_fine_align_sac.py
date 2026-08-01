@@ -1,8 +1,7 @@
 """Train SAC from scratch on the vision-free window fine-alignment task.
 
-This entry point intentionally creates a plain Box-observation environment and
-uses ``MlpPolicy``. It has no dependency on the legacy demonstration, behavior
-cloning, HER, guidance, or action-blending training stack.
+This entry point creates a plain Box-observation environment and uses
+``MlpPolicy`` for the five fine-alignment controls.
 """
 
 from __future__ import annotations

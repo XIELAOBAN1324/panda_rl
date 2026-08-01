@@ -13,7 +13,7 @@ import numpy as np
 class WindowAssemblyStage(str, Enum):
     APPROACH = "approach"
     DESCEND = "descend"
-    SUCTION_GRASP = "suction_grasp"
+    GRASP = "grasp"
     LIFT = "lift"
     REORIENT = "reorient"
     COARSE_ALIGN = "coarse_align"

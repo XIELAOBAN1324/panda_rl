@@ -95,7 +95,7 @@ def test_reorient_flips_at_post_lift_center_before_transport(monkeypatch):
         assert [record.stage for record in base.stage_tracker.records[:6]] == [
             "approach",
             "descend",
-            "suction_grasp",
+            "grasp",
             "lift",
             "reorient",
             "coarse_align",

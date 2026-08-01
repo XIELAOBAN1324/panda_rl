@@ -15,6 +15,34 @@ import numpy as np
 CORNER_NAMES = ("top_left", "top_right", "bottom_right", "bottom_left")
 
 
+def window_insert_waypoints(
+    object_position: np.ndarray,
+    goal_position: np.ndarray,
+    goal_normal: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute the scripted transport, prealign, preinsert, and insert points."""
+
+    object_position = np.asarray(object_position, dtype=np.float32)
+    goal_position = np.asarray(goal_position, dtype=np.float32)
+    normal = normalize_vector(np.asarray(goal_normal, dtype=np.float32))
+    retreat = goal_position - normal * 0.20
+    transport = np.array(
+        [
+            retreat[0],
+            goal_position[1],
+            max(float(object_position[2]), float(goal_position[2]) + 0.14),
+        ],
+        dtype=np.float32,
+    )
+    prealign = goal_position - normal * 0.14
+    preinsert = goal_position - normal * 0.03
+    final_insert = goal_position - normal * 0.003
+    return tuple(
+        point.astype(np.float32)
+        for point in (transport, prealign, preinsert, final_insert)
+    )
+
+
 def normalize_vector(vector: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """Return a normalized float64 vector, rejecting degenerate inputs."""
 
