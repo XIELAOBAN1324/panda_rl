@@ -253,9 +253,7 @@ def fine_alignment_costs(
     mean_cost = float(np.mean([huber_scalar(value) for value in normalized]))
     worst_cost = stable_smooth_max_abs(normalized, kappa=smooth_max_kappa)
     alignment_cost = 0.7 * mean_cost + 0.3 * worst_cost
-    normal_gap_error = float(
-        errors["normal_gap_error"] if "normal_gap_error" in errors else errors["normal_gap_drift"]
-    )
+    normal_gap_error = float(errors["normal_gap_error"])
     normalized_gap = normal_gap_error / normal_gap_tolerance
     gap_cost = huber_scalar(normalized_gap)
     state_cost = alignment_cost + 0.1 * gap_cost

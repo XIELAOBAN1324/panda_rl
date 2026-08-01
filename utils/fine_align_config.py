@@ -31,7 +31,7 @@ FINAL_ENV_PARAMETERS = (
         int,
         2,
     ),
-    ("max_normal_gap_drift", "max_normal_gap_drift", float, 0.008),
+    ("max_normal_gap_error", "max_normal_gap_error", float, 0.008),
     ("insert_action_sim_steps", "insert_action_sim_steps", int, 4),
     (
         "insert_translation_abort_tolerance",
@@ -126,7 +126,7 @@ def validate_final_environment_kwargs(values: dict[str, Any]) -> None:
             raise ValueError(f"{key} must be positive")
     positive_float_keys = (
         "preinsert_normal_offset",
-        "max_normal_gap_drift",
+        "max_normal_gap_error",
         "insert_step_size",
     )
     for key in positive_float_keys:

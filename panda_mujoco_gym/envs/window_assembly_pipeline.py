@@ -123,6 +123,7 @@ class WindowAssemblyPipeline:
     def __init__(self, env: Any) -> None:
         self.env = env
         self.base = env.unwrapped
+        self.controller = self.base.script_controller
 
     def run_episode(
         self,
@@ -171,15 +172,17 @@ class WindowAssemblyPipeline:
         failure_reason = str(info.get("failure_reason", ""))
         failure_category = ""
         if fine_success and ready_for_insert:
-            insert_success = bool(self.base.run_scripted_insert())
+            insert_success = bool(self.controller.run_insert())
             if frame_callback is not None:
                 frame_callback(self.env)
             if insert_success:
-                hold_success = bool(self.base.run_scripted_hold())
+                hold_success = bool(self.controller.run_hold())
                 if frame_callback is not None:
                     frame_callback(self.env)
             if hold_success:
-                assembly_verified, assembly_diagnostics = self.base.verify_final_assembly()
+                assembly_verified, assembly_diagnostics = (
+                    self.controller.verify_final_assembly()
+                )
                 if not assembly_verified:
                     failure_reason = str(
                         assembly_diagnostics.get(
@@ -192,7 +195,7 @@ class WindowAssemblyPipeline:
             elif not hold_success:
                 failure_reason = self._last_failure_reason("hold_failed")
 
-        insert_diagnostics = self.base.get_last_insert_diagnostics()
+        insert_diagnostics = self.controller.get_last_insert_diagnostics()
         pipeline_end_error_values = self.base.get_fine_alignment_errors()
         pipeline_end_errors = {
             key: float(pipeline_end_error_values[key]) for key in self.ERROR_KEYS

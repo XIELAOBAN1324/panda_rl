@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normal-gap-tolerance", type=float, default=0.001)
     parser.add_argument("--normal-gap-correction-threshold", type=float, default=0.0005)
     parser.add_argument("--normal-gap-correction-sim-steps", type=int, default=2)
-    parser.add_argument("--max-normal-gap-drift", type=float, default=0.008)
+    parser.add_argument("--max-normal-gap-error", type=float, default=0.008)
     parser.add_argument("--insert-action-sim-steps", type=int, default=4)
     parser.add_argument("--insert-translation-abort-tolerance", type=float, default=0.0025)
     parser.add_argument("--insert-tilt-abort-tolerance-deg", type=float, default=0.6)
@@ -114,7 +114,7 @@ def environment_kwargs(
         "normal_gap_tolerance": args.normal_gap_tolerance,
         "normal_gap_correction_threshold": args.normal_gap_correction_threshold,
         "normal_gap_correction_sim_steps": args.normal_gap_correction_sim_steps,
-        "max_normal_gap_drift": args.max_normal_gap_drift,
+        "max_normal_gap_error": args.max_normal_gap_error,
         "insert_action_sim_steps": args.insert_action_sim_steps,
         "insert_translation_abort_tolerance": args.insert_translation_abort_tolerance,
         "insert_tilt_abort_tolerance_deg": args.insert_tilt_abort_tolerance_deg,
@@ -188,8 +188,8 @@ def main() -> None:
         raise ValueError("--preinsert-normal-offset must be positive")
     if args.normal_gap_correction_threshold < 0.0:
         raise ValueError("--normal-gap-correction-threshold must be non-negative")
-    if args.max_normal_gap_drift <= 0.0:
-        raise ValueError("--max-normal-gap-drift must be positive")
+    if args.max_normal_gap_error <= 0.0:
+        raise ValueError("--max-normal-gap-error must be positive")
     if args.insert_step_size <= 0.0:
         raise ValueError("--insert-step-size must be positive")
     if args.insert_depth_tolerance < 0.0:

@@ -13,7 +13,6 @@ register(
         "FrankaWindowFineAlignEnv"
     ),
     kwargs={
-        "reward_type": "dense",
         "max_episode_steps": 100,
         "coarse_translation_range": 0.015,
         "coarse_tilt_range_deg": 2.0,
@@ -29,7 +28,7 @@ register(
         "normal_gap_tolerance": 0.001,
         "normal_gap_correction_threshold": 0.0005,
         "normal_gap_correction_sim_steps": 2,
-        "max_normal_gap_drift": 0.008,
+        "max_normal_gap_error": 0.008,
         "insert_action_sim_steps": 4,
         "insert_translation_abort_tolerance": 0.0025,
         "insert_tilt_abort_tolerance_deg": 0.6,

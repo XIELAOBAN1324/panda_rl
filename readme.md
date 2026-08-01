@@ -27,13 +27,17 @@ FrankaWindowFineAlignDense-v0
 核心分层：
 
 ```text
-panda_env.py                    Panda/MuJoCo 底层控制
-window_assembly_scene.py        窗框、玻璃、吸盘、碰撞与状态
-window_assembly_geometry.py     装调几何和路径计算
-window_assembly_controller.py   八个脚本阶段使用的运动控制
-window_fine_align.py            5 DoF 精定位 MDP
-window_assembly_pipeline.py     严格九阶段编排与统计
+panda_env.py                    Panda、MuJoCo、mocap、控制步进和渲染基础能力
+window_assembly_scene.py        窗框、玻璃、吸盘、场景采样、对象状态和碰撞检测
+window_assembly_geometry.py     坐标系、四角点、位姿误差、投影和路径数学
+window_assembly_controller.py   八个脚本阶段、底层插值、阶段诊断和最终装配验证
+window_fine_align.py            精定位 reset、11 维 observation、5 维 step、reward 和终止
+window_assembly_pipeline.py     九阶段编排、仅在 fine_align 调用 policy、结果统计
 ```
+
+环境 reset 调用 controller 完成 `approach` 至 `coarse_align`，然后只暴露
+`fine_align` MDP。精定位成功后，pipeline 直接调用 controller 的 `run_insert()`、
+`run_hold()` 和 `verify_final_assembly()`。controller 不依赖训练代码，也不调用策略。
 
 ## 安装
 
@@ -76,11 +80,12 @@ export MUJOCO_GL=egl
 ```bash
 MUJOCO_GL=egl /home/lsy/.conda/envs/panda_rl/bin/python \
   evaluate/evaluate_window_assembly_pipeline.py \
-  --model outputs/window_fine_align/RUN/models/best_model.zip \
+  --model outputs/window_fine_align/sac-20260721-205122-seed0/models/checkpoints/window_fine_align_sac_150000_steps.zip \
   --episodes 20 \
   --seed 0 \
   --deterministic \
-  --record-video
+  --record-video \
+  --output-dir outputs/visualization/modle1500/
 ```
 
 评估不会从模型目录推断环境配置。若训练时改过装调参数，评估时必须显式传入相同参数。
@@ -108,10 +113,10 @@ MUJOCO_GL=egl /home/lsy/.conda/envs/panda_rl/bin/python \
 
 ```bash
 /home/lsy/.conda/envs/panda_rl/bin/python -m compileall -q \
-  panda_mujoco_gym train evaluate utils \
+  panda_mujoco_gym train evaluate utils tests \
   capture_stage_snapshots.py launch_multi_seed.py
 
-/home/lsy/.conda/envs/panda_rl/bin/python -m pytest -q test tests
+/home/lsy/.conda/envs/panda_rl/bin/python -m pytest -q tests
 ```
 
 训练产物使用 flat 11 维 observation 和 5 维 action。满足这两个 space 的现有最终精定位 SAC 模型可直接显式加载；模型文件旁的环境配置不会被自动读取。

@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 import mujoco
 import numpy as np
+from gymnasium import Env, spaces
 from gymnasium_robotics.envs.robot_env import MujocoRobotEnv
 
 
@@ -33,6 +34,8 @@ class FrankaEnv(MujocoRobotEnv):
         orientation_action_size: int = 3,
         position_action_scale: float = 0.05,
         rotation_action_scale: float = 0.20,
+        policy_action_space: spaces.Space | None = None,
+        policy_observation_space: spaces.Space | None = None,
         **kwargs: Any,
     ) -> None:
         self.model_path = model_path
@@ -54,7 +57,38 @@ class FrankaEnv(MujocoRobotEnv):
             **kwargs,
         )
 
+        # MujocoRobotEnv internally constructs GoalEnv-style spaces from
+        # ``_get_obs``. Keep those private for its initialization contract and
+        # publish task-specific spaces once, before the concrete env returns.
+        self._robot_action_space = self.action_space
+        self._robot_observation_space = self.observation_space
+        if policy_action_space is not None:
+            self.action_space = policy_action_space
+        if policy_observation_space is not None:
+            self.observation_space = policy_observation_space
         self.ctrl_range = self.model.actuator_ctrlrange
+
+    def _reset_robot_simulation(
+        self,
+        *,
+        seed: int | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Reset the RobotEnv internals without exposing its GoalEnv contract.
+
+        ``GoalEnv.reset`` requires a public Dict space. Concrete flat-observation
+        tasks instead keep that Dict private and call this equivalent reset path,
+        so their public Box remains stable throughout reset.
+        """
+
+        Env.reset(self, seed=seed)
+        did_reset_sim = False
+        while not did_reset_sim:
+            did_reset_sim = self._reset_sim()
+        self.goal = self._sample_goal().copy()
+        robot_observation = self._get_obs()
+        if self.render_mode == "human":
+            self.render()
+        return robot_observation
 
     def _initialize_simulation(self) -> None:
         self.model = self._mujoco.MjModel.from_xml_path(self.fullpath)
@@ -188,6 +222,21 @@ class FrankaEnv(MujocoRobotEnv):
         return np.concatenate(
             [self.data.xpos[body_id], self.data.xquat[body_id]]
         )
+
+    def _joint_limit_violated(self) -> bool:
+        """Return whether any limited MuJoCo joint is outside its range."""
+
+        for joint_id in range(int(self.model.njnt)):
+            if not bool(self.model.jnt_limited[joint_id]):
+                continue
+            qpos_address = int(self.model.jnt_qposadr[joint_id])
+            value = float(self.data.qpos[qpos_address])
+            lower, upper = np.asarray(
+                self.model.jnt_range[joint_id], dtype=np.float64
+            )
+            if value < lower - 1e-5 or value > upper + 1e-5:
+                return True
+        return False
 
     @staticmethod
     def _normalize_vector(

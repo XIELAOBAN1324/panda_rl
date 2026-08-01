@@ -783,9 +783,10 @@ def main() -> None:
             device=args.device,
         )
 
-        original_run_scripted_stage = base._run_scripted_stage
+        controller = base.script_controller
+        original_run_stage = controller.run_stage
 
-        def wrapped_run_scripted_stage(
+        def wrapped_run_stage(
             stage: Any,
             operation: Any,
         ) -> Any:
@@ -797,7 +798,7 @@ def main() -> None:
             ):
                 save_named_image("00_start.png")
 
-            result = original_run_scripted_stage(
+            result = original_run_stage(
                 stage,
                 operation,
             )
@@ -819,12 +820,12 @@ def main() -> None:
 
             return result
 
-        base._run_scripted_stage = wrapped_run_scripted_stage
+        controller.run_stage = wrapped_run_stage
 
         try:
             obs, reset_info = env.reset(seed=args.seed)
         finally:
-            base._run_scripted_stage = original_run_scripted_stage
+            controller.run_stage = original_run_stage
 
         missing_reset_images = [
             filename
@@ -879,11 +880,11 @@ def main() -> None:
         # Stage 8: scripted insert
         if fine_success:
             insert_success = bool(
-                base.run_scripted_insert()
+                controller.run_insert()
             )
 
             insert_diagnostics = dict(
-                base.get_last_insert_diagnostics()
+                controller.get_last_insert_diagnostics()
             )
 
             save_named_image("08_insert_end.png")
@@ -902,11 +903,11 @@ def main() -> None:
         # Stage 9: scripted hold
         if insert_success:
             hold_success = bool(
-                base.run_scripted_hold()
+                controller.run_hold()
             )
 
             insert_diagnostics = dict(
-                base.get_last_insert_diagnostics()
+                controller.get_last_insert_diagnostics()
             )
 
             save_named_image("09_hold_end.png")
@@ -927,7 +928,7 @@ def main() -> None:
             (
                 assembly_verified,
                 assembly_diagnostics,
-            ) = base.verify_final_assembly()
+            ) = controller.verify_final_assembly()
 
             assembly_verified = bool(assembly_verified)
             assembly_diagnostics = dict(assembly_diagnostics)

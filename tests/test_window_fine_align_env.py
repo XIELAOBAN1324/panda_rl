@@ -42,7 +42,7 @@ def test_reorient_flips_at_post_lift_center_before_transport(monkeypatch):
     env = gym.make(ENV_ID, **NO_NOISE)
     try:
         base = env.unwrapped
-        original_move = base._move_attached_object_pose
+        original_move = base.script_controller.move_attached_object_pose
         reorient_calls = []
 
         def record_move(target_center, target_rotation, n_steps, **kwargs):
@@ -58,7 +58,7 @@ def test_reorient_flips_at_post_lift_center_before_transport(monkeypatch):
                 )
             return original_move(target_center, target_rotation, n_steps, **kwargs)
 
-        monkeypatch.setattr(base, "_move_attached_object_pose", record_move)
+        monkeypatch.setattr(base.script_controller, "move_attached_object_pose", record_move)
         observation, _ = env.reset(seed=0)
 
         assert len(reorient_calls) == 2
@@ -107,6 +107,39 @@ def test_reorient_flips_at_post_lift_center_before_transport(monkeypatch):
         env.close()
 
 
+def test_reset_delegates_all_scripted_setup_stages_to_controller(monkeypatch):
+    env = gym.make(ENV_ID, **NO_NOISE)
+    try:
+        base = env.unwrapped
+        controller = base.script_controller
+        calls = []
+        stage_methods = (
+            "run_approach",
+            "run_descend",
+            "run_grasp",
+            "run_lift",
+            "run_reorient",
+            "run_coarse_align",
+        )
+        for method_name in stage_methods:
+            original = getattr(controller, method_name)
+
+            def wrapped(*args, _name=method_name, _original=original, **kwargs):
+                calls.append(_name)
+                return _original(*args, **kwargs)
+
+            monkeypatch.setattr(controller, method_name, wrapped)
+
+        env.reset(seed=0)
+
+        assert calls == list(stage_methods)
+        assert not hasattr(base, "run_" + "scripted_insert")
+        assert not hasattr(base, "run_" + "scripted_hold")
+        assert not hasattr(base, "verify_" + "final_assembly")
+    finally:
+        env.close()
+
+
 def test_reset_spaces_seeded_coarse_state_and_no_normal_action():
     env = gym.make(ENV_ID, **NO_NOISE)
     try:
@@ -124,7 +157,7 @@ def test_reset_spaces_seeded_coarse_state_and_no_normal_action():
         assert info_a["stage"] == "fine_align"
         assert np.isclose(info_a["reference_normal_gap"], 0.08)
         assert abs(info_a["current_normal_gap"] - 0.08) <= 0.003
-        assert np.isclose(info_a["normal_gap_drift"], info_a["normal_gap_error"])
+        assert "normal_gap_" + "drift" not in info_a
 
         frame_normal = info_a["frame_normal_world"]
         frame_rotation = info_a["frame_rotation_world"] if "frame_rotation_world" in info_a else None
@@ -198,7 +231,7 @@ def test_step_keeps_suction_reports_reward_and_never_auto_inserts():
         assert info["is_attached"]
         assert base.stage.value == "fine_align"
         assert not base.insert_success
-        assert abs(info["current_normal_gap"] - initial_gap) < base.max_normal_gap_drift
+        assert abs(info["current_normal_gap"] - initial_gap) < base.max_normal_gap_error
         assert info["fine_action_sim_steps"] == 4
         assert np.isclose(info["commanded_normal_gap"], base.reference_normal_gap)
         assert abs(info["normal_gap_command_error"]) < 1e-8
@@ -234,7 +267,7 @@ def test_cost_progress_and_round_trip_reward_properties():
             "tilt_error_t1": 0.0,
             "tilt_error_t2": 0.0,
             "yaw_error": 0.0,
-            "normal_gap_drift": 0.0,
+            "normal_gap_error": 0.0,
         }
         bad = dict(good, error_u=0.01)
         good_cost = float(base._costs(good)["state_cost"])
@@ -266,10 +299,10 @@ def test_success_requires_consecutive_steps_then_allows_separate_insert_and_hold
         assert not base.insert_success  # the successful RL step did not insert
         pre_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
         assert pre_insert_gap > 0.075
-        assert base.run_scripted_insert()
+        assert base.script_controller.run_insert()
         post_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
         assert post_insert_gap < 0.01
-        assert base.run_scripted_hold(hold_steps=5)
+        assert base.script_controller.run_hold(hold_steps=5)
     finally:
         env.close()
 
@@ -307,7 +340,7 @@ def test_scripted_insert_is_rejected_before_ready():
     env = gym.make(ENV_ID, **NO_NOISE)
     try:
         env.reset(seed=11)
-        assert not env.unwrapped.run_scripted_insert()
+        assert not env.unwrapped.script_controller.run_insert()
         assert env.unwrapped.stage.value == "fine_align"
     finally:
         env.close()
@@ -329,7 +362,7 @@ def test_measurement_noise_changes_only_policy_observation():
                 info["tilt_error_t1"] / base.tilt_tolerance_rad,
                 info["tilt_error_t2"] / base.tilt_tolerance_rad,
                 info["yaw_error"] / base.yaw_tolerance_rad,
-                info["normal_gap_drift"] / base.normal_gap_tolerance,
+                info["normal_gap_error"] / base.normal_gap_tolerance,
             ]
         )
         assert not np.allclose(observation[:6], ground_truth_normalized)
@@ -352,7 +385,6 @@ def test_reset_uses_fixed_preinsert_plane_and_keeps_random_inplane_error():
         for seed in range(30, 40):
             _, info = env.reset(seed=seed)
             assert abs(info["current_normal_gap"] - 0.08) <= 0.003
-            assert abs(info["measured_initial_normal_gap"] - 0.08) <= 0.003
             assert abs(info["error_u"]) <= env.unwrapped.coarse_translation_range
             assert abs(info["error_v"]) <= env.unwrapped.coarse_translation_range
             inplane_errors.append((round(float(info["error_u"]), 5), round(float(info["error_v"]), 5)))
@@ -439,7 +471,7 @@ def test_pure_tilt_actions_do_not_accumulate_normal_gap_or_auto_center_inplane_e
             for _ in range(12):
                 _, _, terminated, truncated, info = env.step(action)
                 gap_errors.append(abs(float(info["normal_gap_error"])))
-                assert info["failure_reason"] != "normal_gap_drift_exceeded"
+                assert info["failure_reason"] != "normal_gap_error_exceeded"
                 if terminated or truncated:
                     break
             final_tilt = np.array([info["tilt_error_t1"], info["tilt_error_t2"]], dtype=np.float64)
@@ -452,7 +484,7 @@ def test_pure_tilt_actions_do_not_accumulate_normal_gap_or_auto_center_inplane_e
 
 def test_random_action_pressure_keeps_normal_gap_failure_near_zero():
     rng = np.random.default_rng(123)
-    normal_gap_drift_failures = 0
+    normal_gap_error_failures = 0
     normal_gap_errors = []
     correction_count = 0
     for episode_index in range(20):
@@ -470,13 +502,13 @@ def test_random_action_pressure_keeps_normal_gap_failure_near_zero():
                 normal_gap_errors.append(abs(float(info["normal_gap_error"])))
                 correction_count += int(bool(info["normal_gap_correction_applied"]))
                 if terminated or truncated:
-                    if info["failure_reason"] == "normal_gap_drift_exceeded":
-                        normal_gap_drift_failures += 1
+                    if info["failure_reason"] == "normal_gap_error_exceeded":
+                        normal_gap_error_failures += 1
                     break
         finally:
             env.close()
 
-    assert normal_gap_drift_failures == 0
+    assert normal_gap_error_failures == 0
     assert max(normal_gap_errors) < 0.005
     assert float(np.mean(normal_gap_errors)) < 0.002
     assert correction_count > 0
@@ -523,7 +555,7 @@ def test_insert_abort_tolerance_adds_hysteresis_over_fine_success_threshold():
     try:
         base = env.unwrapped
         assert not base._within_alignment_tolerance(_insert_error_dict(error_u=0.0021))
-        assert base.get_insert_alignment_failure_reason(
+        assert base.script_controller.get_insert_alignment_failure_reason(
             _insert_error_dict(error_u=0.0021)
         ) == ""
     finally:
@@ -534,27 +566,27 @@ def test_insert_alignment_violation_requires_consecutive_steps():
     env = gym.make(ENV_ID, **NO_NOISE)
     try:
         base = env.unwrapped
-        count, reason = base._update_insert_alignment_violation_count(
+        count, reason = base.script_controller._update_insert_alignment_violation_count(
             _insert_error_dict(error_u=0.0026),
             0,
         )
         assert count == 1
         assert reason == ""
 
-        count, reason = base._update_insert_alignment_violation_count(
+        count, reason = base.script_controller._update_insert_alignment_violation_count(
             _insert_error_dict(error_u=0.0),
             count,
         )
         assert count == 0
         assert reason == ""
 
-        count, reason = base._update_insert_alignment_violation_count(
+        count, reason = base.script_controller._update_insert_alignment_violation_count(
             _insert_error_dict(error_u=0.0026),
             count,
         )
         assert count == 1
         assert reason == ""
-        count, reason = base._update_insert_alignment_violation_count(
+        count, reason = base.script_controller._update_insert_alignment_violation_count(
             _insert_error_dict(error_u=0.0026),
             count,
         )
@@ -592,7 +624,7 @@ def test_insert_alignment_failure_reason_reports_largest_specific_excess():
             ),
         )
         for expected, overrides in cases:
-            assert base.get_insert_alignment_failure_reason(
+            assert base.script_controller.get_insert_alignment_failure_reason(
                 _insert_error_dict(**overrides)
             ) == expected
     finally:
@@ -619,7 +651,7 @@ def test_scripted_insert_uses_configured_substeps_feedback_and_monotonic_gap(mon
         pre_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
         assert abs(pre_insert_gap - base.reference_normal_gap) <= 0.003
 
-        original_move = base._move_attached_object_pose
+        original_move = base.script_controller.move_attached_object_pose
 
         def wrapped_move(target_center, target_rotation, n_steps, *, center_feedback_gain=0.0):
             if base.stage.value == "insert":
@@ -633,8 +665,8 @@ def test_scripted_insert_uses_configured_substeps_feedback_and_monotonic_gap(mon
                 center_feedback_gain=center_feedback_gain,
             )
 
-        monkeypatch.setattr(base, "_move_attached_object_pose", wrapped_move)
-        assert base.run_scripted_insert()
+        monkeypatch.setattr(base.script_controller, "move_attached_object_pose", wrapped_move)
+        assert base.script_controller.run_insert()
         post_insert_gap = float(base.get_fine_alignment_errors()["current_normal_gap"])
         assert post_insert_gap < 0.01
         assert target_gaps
@@ -645,7 +677,7 @@ def test_scripted_insert_uses_configured_substeps_feedback_and_monotonic_gap(mon
             for current_gap, next_gap in zip(target_gaps, target_gaps[1:])
         )
         assert min(target_gaps) <= -base.insert_final_gap + 1e-9
-        diagnostics = base.get_last_insert_diagnostics()
+        diagnostics = base.script_controller.get_last_insert_diagnostics()
         assert diagnostics["insert_action_sim_steps"] == 5
         assert diagnostics["insert_steps"] == len(call_steps)
         assert diagnostics["failure_reason"] == ""
@@ -666,7 +698,7 @@ def _mock_insert_episode(base, monkeypatch, post_move_errors):
         "get_fine_alignment_errors",
         lambda: next(sequence, last),
     )
-    monkeypatch.setattr(base, "_move_attached_object_pose", lambda *args, **kwargs: None)
+    monkeypatch.setattr(base.script_controller, "move_attached_object_pose", lambda *args, **kwargs: None)
 
 
 def test_final_depth_first_violation_cannot_succeed(monkeypatch):
@@ -679,8 +711,8 @@ def test_final_depth_first_violation_cannot_succeed(monkeypatch):
             monkeypatch,
             [_insert_error_dict(current_normal_gap=-0.005, error_v=0.003)],
         )
-        assert not base.run_scripted_insert(max_steps=1)
-        assert base.get_last_insert_diagnostics()["insert_final_alignment_success_count"] == 0
+        assert not base.script_controller.run_insert(max_steps=1)
+        assert base.script_controller.get_last_insert_diagnostics()["insert_final_alignment_success_count"] == 0
     finally:
         env.close()
 
@@ -692,9 +724,9 @@ def test_final_depth_two_consecutive_violations_fail_with_final_reason(monkeypat
         env.reset(seed=2)
         bad = _insert_error_dict(current_normal_gap=-0.005, error_u=0.003)
         _mock_insert_episode(base, monkeypatch, [bad, bad])
-        assert not base.run_scripted_insert(max_steps=2)
+        assert not base.script_controller.run_insert(max_steps=2)
         assert (
-            base.get_last_insert_diagnostics()["failure_reason"]
+            base.script_controller.get_last_insert_diagnostics()["failure_reason"]
             == "insert_final_error_u_exceeded"
         )
     finally:
@@ -708,7 +740,7 @@ def test_final_insert_one_valid_frame_cannot_succeed(monkeypatch):
         env.reset(seed=3)
         good = _insert_error_dict(current_normal_gap=-0.005)
         _mock_insert_episode(base, monkeypatch, [good])
-        assert not base.run_scripted_insert(max_steps=1)
+        assert not base.script_controller.run_insert(max_steps=1)
     finally:
         env.close()
 
@@ -720,8 +752,8 @@ def test_final_insert_success_requires_three_consecutive_valid_frames(monkeypatc
         env.reset(seed=3)
         good = _insert_error_dict(current_normal_gap=-0.005)
         _mock_insert_episode(base, monkeypatch, [good, good, good])
-        assert base.run_scripted_insert(max_steps=3)
-        diagnostics = base.get_last_insert_diagnostics()
+        assert base.script_controller.run_insert(max_steps=3)
+        diagnostics = base.script_controller.get_last_insert_diagnostics()
         assert diagnostics["insert_final_alignment_success_count"] == 3
         assert diagnostics["insert_final_verification_steps"] == 3
     finally:
@@ -741,8 +773,8 @@ def test_final_insert_valid_count_resets_on_violation(monkeypatch):
         good = _insert_error_dict(current_normal_gap=-0.005)
         bad = _insert_error_dict(current_normal_gap=-0.005, error_v=0.003)
         _mock_insert_episode(base, monkeypatch, [good, good, bad, good, good])
-        assert not base.run_scripted_insert(max_steps=5)
-        assert base.get_last_insert_diagnostics()["insert_final_alignment_success_count"] == 2
+        assert not base.script_controller.run_insert(max_steps=5)
+        assert base.script_controller.get_last_insert_diagnostics()["insert_final_alignment_success_count"] == 2
     finally:
         env.close()
 
@@ -753,7 +785,7 @@ def _mock_hold_episode(base, monkeypatch, errors):
     base.stage_tracker.end(base._simulation_step_count, success=True)
     base.stage = base.stage.__class__.INSERT
     base.insert_success = True
-    monkeypatch.setattr(base, "_move_attached_object_pose", lambda *args, **kwargs: None)
+    monkeypatch.setattr(base.script_controller, "move_attached_object_pose", lambda *args, **kwargs: None)
     monkeypatch.setattr(base, "get_fine_alignment_errors", lambda: errors)
 
 
@@ -764,7 +796,7 @@ def test_hold_rejects_stable_but_absolutely_misaligned_glass(monkeypatch):
         env.reset(seed=5)
         errors = _insert_error_dict(current_normal_gap=-0.005, error_v=0.0032)
         _mock_hold_episode(base, monkeypatch, errors)
-        assert not base.run_scripted_hold(hold_steps=2)
+        assert not base.script_controller.run_hold(hold_steps=2)
         assert base.stage_tracker.records[-1].failure_reason == "hold_error_v_exceeded"
     finally:
         env.close()
@@ -777,8 +809,8 @@ def test_hold_accepts_relative_stability_and_valid_absolute_geometry(monkeypatch
         env.reset(seed=6)
         errors = _insert_error_dict(current_normal_gap=-0.005, error_u=0.001)
         _mock_hold_episode(base, monkeypatch, errors)
-        assert base.run_scripted_hold(hold_steps=2)
-        diagnostics = base.get_last_insert_diagnostics()
+        assert base.script_controller.run_hold(hold_steps=2)
+        diagnostics = base.script_controller.get_last_insert_diagnostics()
         assert diagnostics["hold_max_abs_error_u"] == 0.001
         assert diagnostics["hold_min_normal_gap"] == -0.005
     finally:
@@ -795,7 +827,7 @@ def test_final_assembly_verification_rejects_alignment_error(monkeypatch):
             "get_fine_alignment_errors",
             lambda: _insert_error_dict(current_normal_gap=-0.005, error_u=0.0028),
         )
-        verified, diagnostics = base.verify_final_assembly()
+        verified, diagnostics = base.script_controller.verify_final_assembly()
         assert not verified
         assert diagnostics["failure_reason"] == "final_assembly_error_u_exceeded"
     finally:
@@ -812,7 +844,7 @@ def test_final_assembly_verification_rejects_insufficient_depth(monkeypatch):
             "get_fine_alignment_errors",
             lambda: _insert_error_dict(current_normal_gap=0.0),
         )
-        verified, diagnostics = base.verify_final_assembly()
+        verified, diagnostics = base.script_controller.verify_final_assembly()
         assert not verified
         assert diagnostics["failure_reason"] == "final_assembly_depth_invalid"
     finally:
@@ -829,7 +861,7 @@ def test_final_assembly_verification_accepts_valid_geometry(monkeypatch):
             "get_fine_alignment_errors",
             lambda: _insert_error_dict(current_normal_gap=-0.005),
         )
-        verified, diagnostics = base.verify_final_assembly()
+        verified, diagnostics = base.script_controller.verify_final_assembly()
         assert verified
         assert diagnostics["failure_reason"] == ""
     finally:
@@ -844,7 +876,7 @@ def test_insert_hysteresis_recovers_from_one_violation(monkeypatch):
         good = _insert_error_dict(current_normal_gap=-0.005)
         bad = _insert_error_dict(current_normal_gap=-0.005, error_u=0.0026)
         _mock_insert_episode(base, monkeypatch, [bad, good, good, good])
-        assert base.run_scripted_insert(max_steps=4)
+        assert base.script_controller.run_insert(max_steps=4)
     finally:
         env.close()
 
@@ -861,9 +893,9 @@ def test_illegal_collision_fails_insert_immediately(monkeypatch):
             "_window_collision_reason",
             lambda: "glass_window_illegal_collision",
         )
-        assert not base.run_scripted_insert(max_steps=1)
+        assert not base.script_controller.run_insert(max_steps=1)
         assert (
-            base.get_last_insert_diagnostics()["failure_reason"]
+            base.script_controller.get_last_insert_diagnostics()["failure_reason"]
             == "glass_window_illegal_collision"
         )
     finally:

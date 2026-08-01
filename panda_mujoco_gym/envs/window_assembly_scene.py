@@ -26,7 +26,6 @@ class WindowAssemblyScene(FrankaEnv):
     def __init__(
         self,
         *,
-        reward_type: str = "dense",
         target_visible_in_rgb_array: bool = True,
         **kwargs: Any,
     ) -> None:
@@ -296,6 +295,34 @@ class WindowAssemblyScene(FrankaEnv):
         self._grasp_relative_position = relative_position.copy()
         self._grasp_relative_quat = self._normalize_vector(relative_quaternion)
         self._set_grasp_weld_active(True)
+
+    def _grasp_weld_is_active(self) -> bool:
+        """Return whether the scene's suction attachment is active."""
+
+        return bool(
+            self.is_attached
+            and self.grasp_weld_eq_id >= 0
+            and int(self.model.eq_active[self.grasp_weld_eq_id]) == 1
+        )
+
+    def _window_collision_reason(self) -> str:
+        """Classify illegal glass/effecter contacts with the window frame."""
+
+        for contact_index in range(int(self.data.ncon)):
+            contact = self.data.contact[contact_index]
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+            if geom1 in self.window_geom_ids:
+                other = geom2
+            elif geom2 in self.window_geom_ids:
+                other = geom1
+            else:
+                continue
+            if other in self.object_collision_geom_ids:
+                return "glass_window_illegal_collision"
+            if other in self.eef_collision_geom_ids:
+                return "robot_window_illegal_collision"
+        return ""
 
     def _set_grasp_weld_active(self, active: bool) -> None:
         if self.grasp_weld_eq_id < 0:

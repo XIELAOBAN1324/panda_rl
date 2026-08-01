@@ -108,7 +108,7 @@ def test_worst_cost_exposes_one_bad_degree_of_freedom():
         "tilt_error_t1": 0.0,
         "tilt_error_t2": 0.0,
         "yaw_error": np.deg2rad(5.0),
-        "normal_gap_drift": 0.0,
+        "normal_gap_error": 0.0,
     }
     costs = fine_alignment_costs(
         errors,

@@ -85,6 +85,7 @@ class _PipelineVerificationEnv:
         self.stage = SimpleNamespace(value="hold")
         self._verified = bool(verified)
         self._failure_reason = failure_reason
+        self.script_controller = self
 
     @staticmethod
     def _errors(**overrides):
@@ -112,10 +113,10 @@ class _PipelineVerificationEnv:
     def get_fine_alignment_errors(self):
         return self._errors()
 
-    def run_scripted_insert(self):
+    def run_insert(self):
         return True
 
-    def run_scripted_hold(self):
+    def run_hold(self):
         return True
 
     def verify_final_assembly(self):

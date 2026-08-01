@@ -1,13 +1,15 @@
 """Regression tests for the final window-assembly contract."""
 
+import gymnasium as gym
+import inspect
 from types import SimpleNamespace
 
-import gymnasium as gym
 import numpy as np
 import pytest
 from gymnasium import spaces
 
 import panda_mujoco_gym  # noqa: F401
+from panda_mujoco_gym.envs.window_fine_align import FrankaWindowFineAlignEnv
 from panda_mujoco_gym.envs.window_assembly_pipeline import (
     WINDOW_ASSEMBLY_STAGE_ORDER,
     WindowAssemblyPipeline,
@@ -27,18 +29,32 @@ EXPECTED_STAGES = (
 )
 
 
-def test_only_final_environment_is_registered_and_legacy_kwargs_are_rejected():
+def test_only_final_environment_is_registered_and_removed_kwargs_are_rejected():
     project_ids = {
         env_id
         for env_id in gym.envs.registry
         if env_id.startswith("FrankaWindow")
     }
     assert project_ids == {"FrankaWindowFineAlignDense-v0"}
-    with pytest.raises(TypeError):
-        gym.make(
-            "FrankaWindowFineAlignDense-v0",
-            **{"reset_" + "mode": "full_task"},
-        )
+    for old_env_id in (
+        "Franka" + "PickAndPlace-v0",
+        "Franka" + "Insert-v0",
+        "Franka" + "Prealign-v0",
+    ):
+        with pytest.raises(gym.error.Error):
+            gym.spec(old_env_id)
+    assert "reward_type" not in inspect.signature(
+        FrankaWindowFineAlignEnv.__init__
+    ).parameters
+    for removed_kwargs in (
+        {"reward_type": "dense"},
+        {"reset_mode": "full_task"},
+        {"full_task": True},
+        {"post_grasp_lifted": True},
+        {"post_grasp_prealign": True},
+    ):
+        with pytest.raises(TypeError):
+            gym.make("FrankaWindowFineAlignDense-v0", **removed_kwargs)
 
 
 def test_fine_align_spaces_and_actions_have_no_normal_insertion_control():
@@ -57,6 +73,7 @@ def test_fine_align_spaces_and_actions_have_no_normal_insertion_control():
         assert env.observation_space.shape == (11,)
         assert observation.shape == (11,)
         assert observation.dtype == np.float32
+        assert env.observation_space.contains(observation)
         assert info["stage"] == "fine_align"
 
         frame_rotation = base.get_fine_alignment_errors()["frame_rotation_world"]
@@ -67,7 +84,11 @@ def test_fine_align_spaces_and_actions_have_no_normal_insertion_control():
             )
             assert abs(float(np.dot(translation, frame_rotation[:, 2]))) < 1e-12
 
-        _, _, _, _, step_info = env.step(np.zeros(5, dtype=np.float32))
+        step_observation, _, _, _, step_info = env.step(
+            np.zeros(5, dtype=np.float32)
+        )
+        assert step_observation.shape == (11,)
+        assert env.observation_space.contains(step_observation)
         assert step_info["stage"] == "fine_align"
         assert not base.insert_success
         assert not base.hold_success
@@ -92,6 +113,27 @@ class _Tracker:
     records = []
 
 
+class _PipelineController:
+    def __init__(self, env):
+        self.env = env
+
+    def run_insert(self):
+        self.env.calls.append("insert")
+        return True
+
+    def run_hold(self):
+        self.env.calls.append("hold")
+        return True
+
+    @staticmethod
+    def verify_final_assembly():
+        return True, {"assembly_verified": True}
+
+    @staticmethod
+    def get_last_insert_diagnostics():
+        return {}
+
+
 class _PipelineEnv:
     ERROR_VALUES = {
         "error_u": 0.0,
@@ -108,6 +150,7 @@ class _PipelineEnv:
         self.unwrapped = self
         self.stage_tracker = _Tracker()
         self.stage = SimpleNamespace(value="hold")
+        self.script_controller = _PipelineController(self)
 
     def reset(self, seed):
         self.calls.extend(EXPECTED_STAGES[:6])
@@ -122,22 +165,6 @@ class _PipelineEnv:
 
     def get_fine_alignment_errors(self):
         return dict(self.ERROR_VALUES)
-
-    def run_scripted_insert(self):
-        self.calls.append("insert")
-        return True
-
-    def run_scripted_hold(self):
-        self.calls.append("hold")
-        return True
-
-    @staticmethod
-    def verify_final_assembly():
-        return True, {"assembly_verified": True}
-
-    @staticmethod
-    def get_last_insert_diagnostics():
-        return {}
 
 
 class _Policy:
