@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ctypes
 import sys
 import time
@@ -356,3 +357,72 @@ class InteractiveCameraTuner:
     def _format_vec(vec: np.ndarray, precision: int = 6) -> str:
         values = np.asarray(vec, dtype=np.float64).reshape(-1)
         return "[" + ", ".join(f"{value:.{precision}f}" for value in values) + "]"
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Interactive MuJoCo camera tuner for the final "
+            "window fine-alignment environment."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--env",
+        type=str,
+        default=panda_mujoco_gym.FINE_ALIGN_ENV_ID,
+        help="Gymnasium environment ID to load.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Initial reset seed. Press N in the viewer to reset "
+            "with the next seed."
+        ),
+    )
+    parser.add_argument(
+        "--angle-speed",
+        type=float,
+        default=75.0,
+        help="Keyboard azimuth/elevation speed in degrees per second.",
+    )
+    parser.add_argument(
+        "--distance-speed",
+        type=float,
+        default=1.2,
+        help="Keyboard zoom speed in MuJoCo distance units per second.",
+    )
+    parser.add_argument(
+        "--lookat-speed",
+        type=float,
+        default=0.45,
+        help="Keyboard lookat movement speed in world units per second.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    tuner = InteractiveCameraTuner(
+        env_id=args.env,
+        seed=args.seed,
+    )
+    tuner.angle_speed_deg = float(args.angle_speed)
+    tuner.distance_speed = float(args.distance_speed)
+    tuner.lookat_speed = float(args.lookat_speed)
+
+    try:
+        tuner.run()
+    except KeyboardInterrupt:
+        print("\nCamera tuner interrupted.")
+    finally:
+        tuner.close()
+
+
+if __name__ == "__main__":
+    main()
+

@@ -9,12 +9,20 @@ import numpy as np
 from gymnasium import Env, spaces
 from gymnasium_robotics.envs.robot_env import MujocoRobotEnv
 
+# 正后方视角
+# DEFAULT_CAMERA_CONFIG = {
+#     "distance": 2.760000,
+#     "azimuth": -1.000000,
+#     "elevation": -10.500000,
+#     "lookat": np.array([0.900000, -0.085000, 0.185000], dtype=np.float64),
+# }
 
+# 侧面视角
 DEFAULT_CAMERA_CONFIG = {
-    "distance": 2.76,
-    "azimuth": -1.0,
-    "elevation": -25.5,
-    "lookat": np.array([0.18, -0.04, 0.185]),
+    "distance": 2.760000,
+    "azimuth": 96.500000,
+    "elevation": -18.000000,
+    "lookat": np.array([0.180000, 0.005000, 0.140000], dtype=np.float64),
 }
 
 

@@ -80,8 +80,8 @@ export MUJOCO_GL=egl
 ```bash
 MUJOCO_GL=egl /home/lsy/.conda/envs/panda_rl/bin/python \
   evaluate/evaluate_window_assembly_pipeline.py \
-  --model outputs/window_fine_align/sac-20260721-205122-seed0/models/checkpoints/window_fine_align_sac_150000_steps.zip \
-  --episodes 20 \
+  --model outputs/window_fine_align/sac-20260801-183135-seed0/models/best_model.zip \
+  --episodes 5 \
   --seed 0 \
   --deterministic \
   --record-video \
